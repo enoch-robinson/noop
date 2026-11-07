@@ -65,6 +65,13 @@ export const now = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
 export const today = () => new Date().toLocaleDateString("sv-SE"); // YYYY-MM-DD local
 export const hhmm = () => new Date().toLocaleTimeString("sv-SE").slice(0, 5);
 
+/** Answer provenance for the decision metrics: "button:slack" → answered_via "button" + answered_channel "slack";
+ *  every owner answer also records created→answered ms (old cards just lack the fields, and readers skip them). */
+export const answeredMeta = (meta: Record<string, string>, via?: string) => ({
+  ...(via ? { answered_via: via.split(":")[0], answered_channel: via.split(":")[1] ?? "" } : {}),
+  answered_ms: String(Math.max(0, Date.now() - (Date.parse(meta.created) || Date.now()))),
+});
+
 // ------------------------------------------------------------------ data sync (src/sync.ts)
 // All data mutations are serialized so parallel workers in one daemon never race on the mirror.
 let chain: Promise<unknown> = Promise.resolve();

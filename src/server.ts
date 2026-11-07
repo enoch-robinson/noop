@@ -24,18 +24,28 @@ import { parseTaskBody, taskHistory, taskInfo } from "../cloud/src/tools";
 import { localStore } from "./brain";
 import { ensureWebClient } from "./webclient";
 
+/** One tappable option on a decision/proposals/menu card; `options` (plain strings) stays for older clients. */
+export type CardOption = { key: string; label: string; consequence?: string; recommended?: boolean; risk?: "high" };
+
 export type Event = {
-  id: string; ts: string; from: string; kind: "notice" | "decision" | "menu" | "proposals" | "login" | "owner" | "system";
+  id: string; ts: string; from: string; kind: "notice" | "decision" | "menu" | "proposals" | "login" | "owner" | "system" | "resolved";
   text: string; ref?: string; options?: string[]; attachments?: string[];
+  /** Structured card options: buttons and push actions render from these. */
+  choices?: CardOption[];
   /** Said inside a task's own conversation: shown on the task page, not in the main channel. */
   thread?: boolean;
+  /** resolved events only: how the card ended (answered / ignored / overridden / superseded / snoozed) and by whom. */
+  state?: string; by?: string;
+  /** owner events only: how the reply arrived ("button:slack" / "text:chat" / "push_action:ntfy" / "card_page:web"),
+   *  for the answer-latency and channel metrics. */
+  via?: string;
 };
 
 export const MEDIA = join(DATA, "..", "media");
 const NSH_WEB = join(import.meta.dir, "..", "app", "dist", "web", "noop"); // built NSH web client
 const FEED_DIR = join(DATA, "..", "feed"); // primary-local (next to the data repo), append-only JSONL per day
 const sockets = new Set<ServerWebSocket<unknown>>();
-type Inbound = { id: string; answer: string; source: string };
+type Inbound = { id: string; answer: string; source: string; via?: string };
 const inbound: Inbound[] = [];
 /** A chat message goes to the chat brain (src/brain.ts), which replies and acts through noop's tools. `reply`: the task
  * whose message the owner replied to ("T-0125"), or whose page they wrote on; `answered`: the decision the owner answered
@@ -307,7 +317,8 @@ export async function updateFleet(): Promise<string> {
   appendEvent({ from: "hub", kind: "system", text: `已通知 ${n} 台机器更新到最新代码：空闲的马上更新，有任务在跑的等跑完再重启；主控机同时重新发布线上。` });
   return "ok";
 }
-const AMEND_MS = 5 * 60_000;
+/** How long a reply to a just-answered card counts as a correction of that answer, not a new instruction. */
+export const AMEND_MS = 5 * 60_000;
 
 // ---------------------------------------------------------------- the owner's images (attachments of a chat message)
 // Downloaded next to the data repo (not into it: the repo syncs through git / the Worker's files API, which is no place
@@ -363,7 +374,7 @@ export function withAttachments(text: string, files: string[], missing = 0): str
 
 export async function handleOwnerMessage(
   text: string, reply_to?: string, noAmend = false,
-  att: { paths?: string[]; key?: string; fetch?: FetchAttachment; sentAt?: string; thread?: boolean } = {},
+  att: { paths?: string[]; key?: string; fetch?: FetchAttachment; sentAt?: string; thread?: boolean; via?: string } = {},
 ) {
   if (att.paths?.length) {
     const files = await saveAttachments(att.key ?? crypto.randomUUID(), att.paths, att.fetch);
@@ -374,7 +385,7 @@ export async function handleOwnerMessage(
   // a reply to an agent's message about a task (or a message on its page): it goes to that task, whatever came just before
   const replyTask = !id && reply_to && /^T-\d{4,}$/.test(reply_to) ? reply_to : undefined;
   if (id) {
-    inbound.push({ id, answer: (m ? m[2] : text).trim(), source: "chat" });
+    inbound.push({ id, answer: (m ? m[2] : text).trim(), source: "chat", via: att.via });
     if (id.startsWith("D-")) lastAnswer = { id, at: Date.now() };
   } else if (ownerTask) {
     // everything else goes to the chat brain: it answers, looks things up, and creates or adjusts work through the tools
@@ -501,8 +512,8 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
         if (files.some((p) => !existsSync(join(MEDIA, basename(p))))) return json({ error: "attachment not found" }, 400);
         if (!text.trim() && !files.length) return json({ error: "text required" }, 400);
         const thread = inThread === true && /^T-/.test(reply_to ?? "");
-        const ev = appendEvent({ from: "owner", kind: "owner", text, ref: reply_to, ...(files.length ? { attachments: files } : {}), ...(thread ? { thread } : {}) });
-        await handleOwnerMessage(text, reply_to, false, { paths: files, key: ev.id, thread });
+        const ev = appendEvent({ from: "owner", kind: "owner", text, ref: reply_to, via: "text:chat", ...(files.length ? { attachments: files } : {}), ...(thread ? { thread } : {}) });
+        await handleOwnerMessage(text, reply_to, false, { paths: files, key: ev.id, thread, via: "text:chat" });
         return json(ev);
       }
       return json({ error: "not found" }, 404);

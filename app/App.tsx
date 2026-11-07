@@ -81,6 +81,9 @@ import {
   normalizeUrl,
   osOf,
   recommended,
+  isRisky,
+  resolvedStateOf,
+  resolvedTsOf,
   type Attachment,
   attachProblem,
   filePath,
@@ -996,6 +999,9 @@ function ProposalList(props: { event: HubEvent; selection: Map<string, Signal<Se
 /** The answer that sets a question aside (the hub's decisions.IGNORE). */
 const IGNORE = "忽略";
 
+/** How long a sent answer can still be edited (mirrors AMEND_MS in src/server.ts; the hub is the real gate). */
+const AMEND_MS = 5 * 60_000;
+
 function answerText(t: string): string {
   const [, ref, rest] = t.match(/^([DLP]-[A-Z]?\d{4}) (.+)$/) ?? [, "", t];
   const a = rest.trim();
@@ -1169,11 +1175,29 @@ function Message(props: {
   );
   const done = () => !!e.ref && props.answered().has(e.ref);
   const picked = () => (e.ref && done() ? answerOf(props.hub.events(), e.ref) : null);
+  /** The card was answered and the amend window is open: the reply box edits the answer (the hub requeues the task). */
+  const amendable = () => {
+    if (!done() || !e.ref) return false;
+    const st = resolvedStateOf(props.hub.events(), e.ref);
+    if (st && st !== "answered") return false; // ignored / snoozed cards have no answer to amend
+    const t = resolvedTsOf(props.hub.events(), e.ref);
+    return !!t && Date.now() - Date.parse(t) < AMEND_MS;
+  };
+  /** A gated option (merge / release / deploy) confirms first: the tap is an instruction, not a missed scroll. */
+  const answerCard = (ref: string, c: string) => {
+    if (!isRisky(e, c)) return props.onAnswer(ref, c);
+    void AlertDialog.show({
+      title: L(`Confirm ${ref}: ${optionText(e, c)}?`, `确认 ${ref}：${optionText(e, c)}？`),
+      description: L("This is hard to undo (merge, release, deploy) and the team acts on it right away.", "这类操作不易回退（合并、发布、部署），团队会立刻执行。"),
+      actions: [{ id: "back", label: L("Back", "再想想"), role: "cancel" }, { id: "go", label: L("Confirm", "确认执行") }],
+    }).then((r) => r.action === "go" && props.onAnswer(ref, c));
+  };
   const targeted = () => ask && !done() && props.target() === e.ref;
   const rec = recommended(e);
   // a phone has no width to spare: the avatar sits in the name's row, and the message takes the whole column
   const wide = () => windowSize().width >= WIDE;
-  if (isHub(e.from) && !ask && e.kind === "system" && !e.attachments?.length)
+  // the hub's own receipts ("✅ D-0012 已答") are lines in the log, not conversation
+  if (isHub(e.from) && !ask && !e.attachments?.length && (e.kind === "system" || e.kind === "resolved"))
     return (
       <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8, paddingVertical: 4, paddingLeft: wide() ? 50 : 0 }}>
         <Text style={{ fontSize: size.tiny, color: colors.faint, fontVariant: ["tabular-nums"] }}>{timeOf(e.ts)}</Text>
@@ -1226,7 +1250,7 @@ function Message(props: {
                     note={rec === c() ? L("Recommended", "推荐") : undefined}
                     disabled={done()}
                     checked={done() && picked()?.toUpperCase() === c().toUpperCase()}
-                    onPress={() => props.onAnswer(e.ref!, c())}
+                    onPress={() => answerCard(e.ref!, c())}
                   />
                 )}
               </Each>
@@ -1238,7 +1262,15 @@ function Message(props: {
                 <Btn testID={`other-${e.ref}`} label={L("Other instructions…", "其他指示…")} kind="dashed" onPress={() => props.onReply(e.ref!)} />
               </If>
               <If when={e.ref!.startsWith("D-") && !done()}>
-                <Btn testID={`ignore-${e.ref}`} label={L("Ignore", "忽略")} kind="dashed" onPress={() => props.onAnswer(e.ref!, IGNORE)} />
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  <Btn testID={`snooze-${e.ref}`} label={L("Later", "稍后")} kind="dashed" onPress={() => props.onAnswer(e.ref!, "稍后")} />
+                  <Btn testID={`ignore-${e.ref}`} label={L("Ignore", "忽略")} kind="dashed" note={L("not a rejection", "不算拒绝")}
+                    accessibilityLabel={L("Ignore — the agent decides and continues; this is not a rejection", "忽略——agent 自行决定并继续，不算拒绝")}
+                    onPress={() => props.onAnswer(e.ref!, IGNORE)} />
+                </View>
+              </If>
+              <If when={amendable()}>
+                <Btn testID={`amend-${e.ref}`} label={L("Change answer", "修改")} kind="dashed" onPress={() => props.onReply(e.ref!)} />
               </If>
             </View>
             </>

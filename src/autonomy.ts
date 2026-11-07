@@ -1,8 +1,10 @@
 // Graduated autonomy. Start conservative ("onboarding"): self-generated work needs owner approval,
 // the judge only shadows. Graduation is proposed by the architect from metrics, decided by the owner.
 import { existsSync, unlinkSync } from "node:fs";
-import { type Cfg, P, journal, list, nextId, now, readDoc, writeDoc } from "./core";
-import { notify } from "./notify";
+import { answeredMeta, type Cfg, P, journal, list, nextId, now, readDoc, writeDoc } from "./core";
+import { notify, resolveReceipt } from "./notify";
+import { asciiFold } from "./reply-parse";
+import { appendEvent, type CardOption } from "./server";
 
 export type Level = "onboarding" | "assisted" | "autonomous";
 /** Global level, optionally overridden per agent ([autonomy.agents] reviewer = "assisted") as trust is earned. */
@@ -71,7 +73,7 @@ export async function proposeBatch(cfg: Cfg, host: string) {
     const alive = listed.some((t: string) => itemIds.includes(t));
     const age = Date.now() - Date.parse(meta.notified ?? meta.created);
     if (alive && age < (cfg.autonomy?.renotify_hours ?? 3) * 3600_000) return;
-    closeBatch(openPath, itemIds.length ? "superseded (rebuilt)" : "superseded (nothing left)");
+    closeBatch(cfg, openPath, itemIds.length ? "superseded (rebuilt)" : "superseded (nothing left)");
     if (!itemIds.length) return;
   } else {
     if (!items.length) return;
@@ -80,34 +82,36 @@ export async function proposeBatch(cfg: Cfg, host: string) {
     if (Date.now() - oldest < batchWait && items.length < 5) return; // let a few accumulate
   }
   const id = nextId("P", P("decisions"));
-  const lines = items.map((p, i) => {
-    const m = readDoc(p).meta;
-    return `${i + 1}. ${m.title}（${m.agent}）`;
-  });
+  const metas = items.map((p) => readDoc(p).meta); // one read per file: lines and choices stay in the same order
+  const lines = metas.map((m, i) => `${i + 1}. ${m.title}（${m.agent}）`);
+  const choices: CardOption[] = [...lines.map((label, i) => ({ key: String(i + 1), label })),
+    { key: "all", label: "all（全做）" }, { key: "none", label: "none（都不做）" }];
   writeDoc(P("decisions", "open", `${id}.md`), {
     id, kind: "proposals", created: now(), notified: now(), host, items: itemIds.join(","),
-    question: "要做哪几项？",
+    question: "要做哪几项？", options: choices.map((o) => o.label).join(" | "), options_json: JSON.stringify(choices),
   }, `## 待确认\n${lines.join("\n")}\n`);
   await notify([`*${id}* 想做这几件事，请确认：`, ...lines,
     `回复 \`${id} 1,3\`、\`${id} all\`（全做）或 \`${id} none\`（都不做）`].join("\n"), cfg,
-    { kind: "proposals", ref: id, options: ["all", "none", ...lines.map((_, i) => String(i + 1))] });
+    { kind: "proposals", ref: id, options: choices.map((o) => o.key), choices });
   journal(host, `${id} asked owner to approve ${items.length} proposed tasks`);
 }
 
 /** Close an unanswered proposals batch without touching its tasks (they stay in tasks/proposed). */
-function closeBatch(path: string, answer: string) {
+function closeBatch(cfg: Cfg, path: string, answer: string) {
   const { meta, body } = readDoc(path);
+  appendEvent({ from: "hub", kind: "resolved", ref: meta.id, state: "superseded", by: "system", text: `${meta.id} 已被新批次取代 →` });
   writeDoc(P("decisions", "closed", `${meta.id}.md`), { ...meta, answer, answered_by: "system", answered: now() }, body + `\n## Answer\n${answer}\n`);
   unlinkSync(path);
+  void resolveReceipt(meta.id, cfg, answer, "system（已被新批次取代）");
 }
 
 /** Owner's answer to a proposals batch: approve picked ones, reject the rest (rejections are a learning signal). */
-export function resolveProposals(id: string, answer: string, by: string): boolean {
+export function resolveProposals(id: string, answer: string, by: string, via?: string): boolean {
   const f = P("decisions", "open", `${id}.md`);
   if (!existsSync(f)) return false;
   const { meta, body } = readDoc(f);
   const ids = (meta.items ?? "").split(",").filter(Boolean);
-  const a = answer.trim().toLowerCase();
+  const a = asciiFold(answer).toLowerCase();
   const picked = new Set<number>(a.startsWith("all") ? ids.map((_, i) => i + 1)
     : a.startsWith("none") ? [] : (a.match(/^[\d,\s，]+/)?.[0] ?? "").split(/[,，\s]+/).filter(Boolean).map(Number));
   const note = answer.replace(/^[\d,\s，]+|^(all|none)\s*/i, "").trim();
@@ -120,8 +124,9 @@ export function resolveProposals(id: string, answer: string, by: string): boolea
       tb + (note && ok ? `\n\n## Owner note (${id})\n${note}\n` : ""));
     unlinkSync(p);
   });
-  writeDoc(P("decisions", "closed", `${id}.md`), { ...meta, answer, answered_by: by, answered: now() }, body + `\n## Answer\n${answer}\n`);
+  writeDoc(P("decisions", "closed", `${id}.md`), { ...meta, answer, answered_by: by, answered: now(), ...answeredMeta(meta, via) }, body + `\n## Answer\n${answer}\n`);
   unlinkSync(f);
+  appendEvent({ from: "hub", kind: "resolved", ref: id, state: "answered", by, text: `${id} 已答：${answer}（${by}）` });
   return true;
 }
 

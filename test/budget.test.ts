@@ -14,7 +14,9 @@ const HOSTS = ["h1", "h2", "h3"], TASKS_PER_HOST = 40, DAY_MIN = 24 * 60;
 const INDEX_FACTOR = 3;
 /** Traffic outside the files API on the same day (src/cloud.ts, app/App.tsx): dashboard pushes on every shape change
  *  plus one every ~15 min, two inbox reads per owner message, owner sends, socket pings at 1/20 of a request, and the
- *  owner app's status fetch on each reconnect. Each costs about two rows written where it writes at all. */
+ *  owner app's status fetch on each reconnect. Each costs about two rows written where it writes at all. Button
+ *  answers (Slack/Discord callbacks, ntfy http actions, /api/answer) need no line here: they are owner-triggered —
+ *  one request per human click, and their inbox event rows are already counted with the owner sends below. */
 const OTHER_REQUESTS = (HOSTS.length * TASKS_PER_HOST * 2 + 96) + 50 * 3 + Math.ceil(DAY_MIN / 20) + 50;
 const OTHER_ROWS = (HOSTS.length * TASKS_PER_HOST * 2 + 96) * 2 + 50 * 6 + 2_000; // + events the fleet reports
 

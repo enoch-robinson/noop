@@ -13,9 +13,19 @@
 //   POST /api/auth/start {email} → mail code · POST /api/auth/verify {email, code} → {session} · POST /api/auth/logout
 // Web Push (owner session): GET /api/push/vapid · POST /api/push/subscribe {subscription, device_label}
 //   · POST /api/push/unsubscribe {endpoint} · POST /api/push/test · POST /api/push/answer {ref, answer}
+// Owner answers (owner session): POST /api/answer {card, choice} — the one endpoint every channel's buttons post to;
+//   it lands in the feed and the owner→fleet inbox exactly like a typed `D-0012 A` reply. ntfy banner buttons post
+//   here too, with the answer-only HUB_ANSWER_TOKEN instead of an owner session.
+// Channel button callbacks: POST /api/slack/interactive (HMAC via HUB_SLACK_SIGNING_SECRET) ·
+//   POST /api/discord/interactive (Ed25519 via HUB_DISCORD_PUBLIC_KEY) — they verify their own signature and
+//   converge on the same ownerMessage path as /api/answer.
 // MCP (Claude / ChatGPT connectors): /mcp + OAuth 2.1 at /oauth/* and /.well-known/oauth-* — see mcp.ts and docs/mcp.md.
 // Every other /api/* and /media/* needs Bearer <HUB_TOKEN|session> (or ?token= for WebSocket / <img>).
 import { DurableObject } from "cloudflare:workers";
+import { needsConfirm, parseAnswer } from "./answer";
+import { cardPage, parseCard } from "./card";
+import { parseSlackPayload, verifySlack } from "./slack";
+import { parseDiscordClick, verifyDiscord } from "./discord";
 import { b64dec, b64enc, handleFiles, handleReadFiles, initFilesSchema } from "./files";
 import { FREE, LEAN, SHED, TARGET, latestOnly } from "./budget";
 import { taskHistory, taskInfo } from "./tools";
@@ -43,7 +53,10 @@ interface Env {
   HUB_VAPID_PUBLIC?: string;  // b64url raw P-256 point
   HUB_VAPID_PRIVATE?: string; // JWK JSON
   HUB_MOVED_TO?: string;    // the hub moved to another Worker (e.g. another account): forward every request there
-}
+  HUB_SLACK_SIGNING_SECRET?: string; // Slack button clicks (/api/slack/interactive): the Slack app's signing secret
+  HUB_DISCORD_PUBLIC_KEY?: string;   // Discord button clicks (/api/discord/interactive): the app's Ed25519 public key (hex)
+  HUB_ANSWER_TOKEN?: string;         // answer-only bearer for ntfy banner buttons: their Actions header hands the
+}                                  // token to the ntfy server (a third party), so it must never be HUB_TOKEN
 
 const json = (d: unknown, status = 200) => Response.json(d, { status });
 const CHUNK = 1_000_000; // SQLite row limit is 2 MB
@@ -231,17 +244,139 @@ export class Hub extends DurableObject<Env> {
   /** Owner→fleet inbox. A waiting long-poll from the primary daemon is answered at once (no polling delay). */
   inboxWaiters = new Set<() => void>();
   acked = 0;
+  /** Per-session answer timestamps for the soft throttle below (in-memory is fine: one DO instance, worst case a
+   *  restart resets it). Bounds a runaway client or a stolen session to a human pace: the owner events this endpoint
+   *  writes are exempt from SHED shedding, so without this an authenticated loop could exhaust the day's free-plan
+   *  row writes in minutes and stall the whole account until 00:00 UTC (AGENTS.md hard rule). */
+  answerTimes = new Map<string, number[]>();
+  /** 20/min and 100/hour per session; returns {error, retry_after} when over. */
+  throttled(session: string): { error: string; retry_after: number } | null {
+   const now = Date.now();
+   const times = (this.answerTimes.get(session) ?? []).filter((t) => now - t < 3600_000);
+   if (times.length >= 100 || times.filter((t) => now - t < 60_000).length >= 20)
+     return { error: "too many answers; slow down", retry_after: 60 };
+   times.push(now);
+   this.answerTimes.set(session, times);
+   return null;
+  }
   toInbox(item: Record<string, unknown>) {
     this.sql.exec("INSERT INTO inbox (json) VALUES (?)", JSON.stringify(item));
     for (const w of [...this.inboxWaiters]) w();
     for (const ws of this.ctx.getWebSockets("host")) try { ws.send('{"type":"inbox"}'); } catch {}
   }
 
-  ownerMessage(text: string, ref?: string, attachments?: string[], thread = false): Ev {
-    const ev = this.append({ from: "owner", kind: "owner", text, ref, ...(attachments?.length ? { attachments } : {}), ...(thread ? { thread } : {}) });
+  ownerMessage(text: string, ref?: string, attachments?: string[], thread = false, via?: string): Ev {
+    const ev = this.append({ from: "owner", kind: "owner", text, ref, ...(via ? { via } : {}), ...(attachments?.length ? { attachments } : {}), ...(thread ? { thread } : {}) });
     this.toInbox({ type: "message", event: ev });
     if (!this.hostOnline()) this.append({ from: "hub", kind: "system", text: "收到。团队的电脑暂时都不在线，上线后会马上处理。", ref: ev.id });
     return ev;
+  }
+
+  /** True while `decisions/open/<id>.md` has no live row in the synced files: a click on an already-answered card
+   *  must not re-enter the inbox. Sync lag ≤ one commit cycle makes this a fast pre-filter; the fleet-side check
+   *  (cli.ts handleReplies drops replies to closed cards) stays the real idempotency. One primary-key read. */
+  cardGone(id: string): boolean {
+    try { return this.sql.exec("SELECT 1 FROM files WHERE path = ? AND deleted = 0", `decisions/open/${id}.md`).toArray().length === 0; }
+    catch { return false; }
+  }
+
+  /** The synced card file's text (open by default, closed for receipts), or "" when absent. One primary-key read. */
+  cardContent(id: string, closed = false): string {
+    try {
+      const r = this.sql.exec("SELECT content FROM files WHERE path = ? AND deleted = 0", `decisions/${closed ? "closed" : "open"}/${id}.md`).toArray()[0];
+      if (!r || r.content == null) return "";
+      const bytes = r.content instanceof Uint8Array ? r.content : new Uint8Array(r.content as ArrayBuffer);
+      return new TextDecoder().decode(bytes);
+    } catch { return ""; }
+  }
+
+  /** Does this choice pick a risk:"high" option? False for anything unreadable — the fleet-side gates stay the wall. */
+  confirmNeeded(id: string, choice: string): boolean {
+    return needsConfirm(this.cardContent(id), choice);
+  }
+
+  /** Is this card closed BY THE JUDGE (the receipt whose veto button is legitimate)? The veto exemption elsewhere
+   *  (409 / confirm gate) applies to judge-ruled cards only, so "override …" cannot smuggle an answer past
+   *  the gates onto an open or owner-closed card. */
+  judgeClosed(id: string): boolean {
+    return /^judge/.test(parseCard(this.cardContent(id, true))?.meta.answered_by ?? "");
+  }
+
+  /** The single-card page. No session → the SPA's login flow (?ref=); answered cards render their final state. */
+  async cardPage(req: Request, p: string, url: URL): Promise<Response> {
+    const raw = (() => { try { return decodeURIComponent(p.slice("/card/".length)); } catch { return ""; } })();
+    const id = raw.toUpperCase();
+    if (!/^[DLP]-[A-Z]?\d{4}$/.test(id)) return json({ error: "not found" }, 404);
+    const who = await this.who(req, url);
+    if (!who) return Response.redirect(`${url.origin}/?ref=${encodeURIComponent(id)}`, 302);
+    const open = this.cardContent(id), closed = open ? "" : this.cardContent(id, true);
+    if (!open && !closed) return json({ error: "not found" }, 404);
+    // a machine's HUB_TOKEN never rides the page: its answers would 403 anyway, and the page holds no other secret
+    const token = who === "machine" ? "" : this.credential(req, url);
+    return new Response(cardPage(id, !!open, open || closed, token, url.origin), { headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store", // the page embeds the session credential: no bfcache / heuristic retention
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+    } });
+  }
+
+  /** Ephemeral note on the clicker's own screen (never a channel message), best effort, response_url only. */
+  slackEphemeral(responseUrl: string, text: string) {
+    if (!/^https:\/\/hooks\.slack\.com\//.test(responseUrl)) return;
+    void fetch(responseUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) }).catch(() => {});
+  }
+
+  /** Slack button click: same ownerMessage as /api/answer, keyed by the shared "slack" throttle bucket. */
+  async slackInteractive(req: Request): Promise<Response> {
+    const secret = this.env.HUB_SLACK_SIGNING_SECRET;
+    if (!secret) return json({ error: "slack interactive not configured" }, 503);
+    const body = await req.text();
+    if (body.length > 1_000_000) return json({ error: "body too large" }, 413); // Slack payloads are tiny; read it anyway to verify the signature
+    if (!(await verifySlack(secret, req.headers.get("x-slack-signature") ?? "", req.headers.get("x-slack-timestamp") ?? "", body)))
+      return json({ error: "invalid signature" }, 403);
+    const { clicks, responseUrl } = parseSlackPayload(body);
+    if (!clicks.length) return json({ error: "no answer action" }, 400); // other interactions: Slack gets no UI change
+    const slow = this.throttled("slack"); // user-triggered: one request per human click
+    if (slow) return json(slow, { status: 429, headers: { "retry-after": String(slow.retry_after) } });
+    const { card, choice } = clicks[0]; // one click per payload in practice; a multi-select tap sends one message
+    const vetoable = /^(override|veto)\b/i.test(choice) && this.judgeClosed(card); // the receipt card is closed: its veto rides through
+    if (this.cardGone(card) && !vetoable) { this.slackEphemeral(responseUrl, `${card} 已经处理过了`); return json({ ok: true }); }
+    if (/^(override|veto)\b/i.test(choice) && !vetoable) { this.slackEphemeral(responseUrl, `无法否决：${card} 不是 judge 代答的卡`); return json({ ok: true }); }
+    this.ownerMessage(`${card} ${choice}`, card, undefined, false, "button:slack");
+    this.slackEphemeral(responseUrl, `✅ 已记录：${card} → ${choice}`);
+    return json({ ok: true });
+  }
+
+  /** Discord interaction: PING handshake, or a component click → ownerMessage; the reply is ephemeral (flags 64),
+   *  so an answered card never becomes channel noise. */
+  async discordInteractive(req: Request): Promise<Response> {
+    const pub = this.env.HUB_DISCORD_PUBLIC_KEY;
+    if (!pub) return json({ error: "discord interactive not configured" }, 503);
+    const body = await req.text();
+    if (body.length > 1_000_000) return json({ error: "body too large" }, 413);
+    const v = await verifyDiscord(pub, req.headers.get("x-signature-ed25519") ?? "", req.headers.get("x-signature-timestamp") ?? "", body);
+    if (v === "bad") return json({ error: "invalid signature" }, 403);
+    const b = (() => { try { return JSON.parse(body) as any; } catch { return {}; } })();
+    if (v === "unsupported") { // no Ed25519 here: PING still passes so app setup completes, but clicks are never recorded
+      if (b?.type === 1) return json({ type: 1 });
+      return json({ type: 4, data: { content: "此处暂时无法安全应答，请到网页端处理这张卡。", flags: 64 } });
+    }
+    if (b?.type === 1) return json({ type: 1 }); // PING
+    const click = parseDiscordClick(b);
+    if (!click) return json({ type: 4, data: { content: "未识别的按钮。", flags: 64 } });
+    const slow = this.throttled("discord");
+    if (slow) return json({ type: 4, data: { content: "点得太快了，稍等几秒再试。", flags: 64 } });
+    // a judge receipt is already closed: its veto button (and only it) rides through the already-answered filter
+    const vetoable = /^(override|veto)\b/i.test(click.choice) && this.judgeClosed(click.card);
+    if (this.cardGone(click.card) && !vetoable) return json({ type: 4, data: { content: `${click.card} 已经处理过了`, flags: 64 } });
+    if (/^(override|veto)\b/i.test(click.choice) && !vetoable)
+      return json({ type: 4, data: { content: `无法否决：${click.card} 不是 judge 代答的卡`, flags: 64 } });
+    // Discord buttons have no native confirm: high-risk choices are refused here and pointed at the card page,
+    // whose confirm step posts /api/answer with {confirm:true} (notify renders high-risk buttons as links already)
+    if (!vetoable && this.confirmNeeded(click.card, click.choice))
+      return json({ type: 4, data: { content: `⚠️ 「${click.choice}」是高风险操作：打开 ${new URL(req.url).origin}/card/${click.card} 确认后执行`, flags: 64 } });
+    this.ownerMessage(`${click.card} ${click.choice}`, click.card, undefined, false, "button:discord");
+    return json({ type: 4, data: { content: `✅ 已记录：${click.card} → ${click.choice}`, flags: 64 } });
   }
 
   // ---- web push
@@ -257,7 +392,12 @@ export class Hub extends DurableObject<Env> {
     const note = notificationFor(ev, (this.get("settings")?.current?.notify_prefs ?? {}) as NotifyRules);
     if (!note) return null;
     const ref = typeof ev.ref === "string" ? ev.ref : undefined;
-    const opts = Array.isArray(ev.options) ? (ev.options as unknown[]).map((o) => String(o).slice(0, 20)).slice(0, 3) : [];
+    // one-tap banner actions for the safe options only: high-risk ones need their confirm step, so the banner's
+    // buttons skip them and a tap opens the app / card page instead (the typed answer from there is deliberate)
+    const choices = Array.isArray(ev.choices) ? (ev.choices as { label: unknown; risk?: string }[]) : [];
+    const labels = (choices.length ? choices.filter((c) => c.risk !== "high").map((c) => String(c.label))
+      : Array.isArray(ev.options) ? ev.options.map(String) : []);
+    const opts = labels.map((o) => o.slice(0, 20)).slice(0, 3);
     const decisions = (this.get("status")?.decisions ?? []) as { held?: boolean }[];
     return {
       urgency: kind === "decision" || kind === "login" ? "high" : "normal",
@@ -291,9 +431,16 @@ export class Hub extends DurableObject<Env> {
     if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
     const b = (await req.json().catch(() => ({}))) as any;
     if (p === "/api/push/answer") {
-      const ref = typeof b?.ref === "string" ? b.ref.trim() : "", answer = typeof b?.answer === "string" ? b.answer.trim() : "";
+      const ref = typeof b?.ref === "string" ? b.ref.trim().toUpperCase() : "", answer = typeof b?.answer === "string" ? b.answer.trim() : "";
       if (!ref || !answer) return json({ error: "ref and answer required" }, 400);
-      return json(this.ownerMessage(`${ref} ${answer}`, ref));
+      const vetoable = /^(override|veto)\b/i.test(answer) && this.judgeClosed(ref); // same veto rules as /api/answer
+      const slow = this.throttled(who === "machine" ? "push" : who.session); // same human-pace bucket, before the 409s
+      if (slow) return json(slow, { status: 429, headers: { "retry-after": String(slow.retry_after) } });
+      if (this.cardGone(ref) && !vetoable) return json({ error: `${ref} is already resolved`, ref }, 409);
+      if (/^(override|veto)\b/i.test(answer) && !vetoable) return json({ error: `${ref} is not a judge-ruled card; veto does not apply`, ref }, 409);
+      if (!vetoable && this.confirmNeeded(ref, answer))
+        return json({ error: "confirm required for a high-risk choice: open the card instead", ref }, 409);
+      return json(this.ownerMessage(`${ref} ${answer}`, ref, undefined, false, "push_action:web"));
     }
     if (who === "machine") return json({ error: "owner session required" }, 403);
     if (p === "/api/push/subscribe") {
@@ -410,9 +557,41 @@ export class Hub extends DurableObject<Env> {
 
     if (p.startsWith("/api/auth/")) return this.auth(p, req);
     if (isMcpPath(p)) return this.mcp.fetch(req, await this.who(req, url));
+    // channel callbacks carry their own signature (Slack HMAC / Discord Ed25519), not a Bearer credential
+    if (p === "/api/slack/interactive" && m === "POST") return this.slackInteractive(req);
+    if (p === "/api/discord/interactive" && m === "POST") return this.discordInteractive(req);
+    // the single-card page: no session → the SPA's login flow (same ?ref= target pushes already use)
+    if (p.startsWith("/card/") && m === "GET") return this.cardPage(req, p, url);
     const who = await this.who(req, url);
-    if (!who) return json({ error: "unauthorized" }, 401);
+    // ntfy banner buttons hold the answer-only token (HUB_ANSWER_TOKEN): the bypass below admits it to exactly ONE
+    // route, POST /api/answer — it may record card answers, nothing else. Scope it to the path, or a null who
+    // would pass every "owner unless machine" route below, up to /api/host/join which hands out HUB_TOKEN. (The
+    // Actions header hands this token to the ntfy server, a third party, so it must never be HUB_TOKEN.)
+    const pushAnswer = !who && p === "/api/answer" && m === "POST" && !!this.env.HUB_ANSWER_TOKEN && sameStr(this.credential(req, url), this.env.HUB_ANSWER_TOKEN);
+    if (!who && !pushAnswer) return json({ error: "unauthorized" }, 401);
     if (p.startsWith("/api/push/")) return this.push(p, req, who);
+    if (p === "/api/answer" && m === "POST") { // one answer endpoint for every channel; a machine never answers
+      if (who === "machine") return json({ error: "owner session required" }, 403);
+      const body = (await req.json().catch(() => ({}))) as any;
+      const a = parseAnswer(body);
+      if ("error" in a) return json({ error: a.error }, 400);
+      const veto = /^(override|veto)\b/i.test(a.choice);
+      const vetoable = veto && this.judgeClosed(a.ref); // only a judge receipt may be vetoed — "override …" on an
+      // open or owner-closed card is refused here instead of slipping past both gates as a literal answer
+      const slow = this.throttled(who ? who.session : "push"); // ahead of the 409s: state probes share the human bucket
+      if (slow) return json(slow, { status: 429, headers: { "retry-after": String(slow.retry_after) } });
+      // resolved cards take only a veto of a judge ruling (the receipt flow); everything else is answered once
+      if (this.cardGone(a.ref) && !vetoable) return json({ error: `${a.ref} is already resolved` }, 409);
+      if (veto && !vetoable) return json({ error: `${a.ref} is not a judge-ruled card; veto does not apply` }, 409);
+      // high-risk options take two deliberate steps: without {confirm:true} the answer is refused and the client
+      // (card page, app) shows its confirm state. Slack's own dialog gates its clicks; the typed chat path never
+      // comes through here, so `D-0012 A` on a gated card keeps working.
+      if (!vetoable && !body.confirm && this.confirmNeeded(a.ref, a.choice))
+        return json({ error: "confirm required for a high-risk choice", card: a.ref, choice: a.choice }, 409);
+      const via = pushAnswer ? "push_action:ntfy" // banner actions carry the answer-only token
+        : typeof body.via === "string" && body.via ? body.via.replace(/[^\w:-]/g, "").slice(0, 24) : "card_page:web";
+      return json(this.ownerMessage(a.text, a.ref, undefined, false, via));
+    }
     if ((p === "/api/files/list" || p === "/api/files/read") && m === "GET") { // owner (and machine) read of READABLE prefixes
       const r = handleReadFiles(this.sql, url);
       if (r) return r;
@@ -514,7 +693,7 @@ export class Hub extends DurableObject<Env> {
       if (files.some((f) => !this.sql.exec("SELECT 1 FROM media WHERE id = ? LIMIT 1", f.slice(7)).toArray().length))
         return json({ error: "attachment not found" }, 400);
       if (!text.trim() && !files.length) return json({ error: "text required" }, 400);
-      return json(this.ownerMessage(text, reply_to, files, thread === true && /^T-/.test(reply_to ?? "")));
+      return json(this.ownerMessage(text, reply_to, files, thread === true && /^T-/.test(reply_to ?? ""), "text:chat"));
     }
 
     // The owner's images for a message (paste / drop / pick in the app): images only, ≤ 10 MB, kept with the media.

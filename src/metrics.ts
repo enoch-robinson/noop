@@ -27,12 +27,25 @@ export function computeMetrics(days = 7) {
   }));
   const approvals = list(P("decisions", "closed")).map((p) => readDoc(p).meta).filter((m) => m.kind === "proposals");
   const rejected = list(P("tasks", "rejected"), /^T-.*\.md$/).length;
+  // answer latency + how/where the owner answers: old closed cards lack answered_ms/answered_via → skipped, not errors
+  const ownerReplied = decisions.filter((m) => /^owner/.test(m.answered_by ?? ""));
+  const ms = ownerReplied.map((m) => Number(m.answered_ms)).filter((n) => Number.isFinite(n) && n >= 0).sort((a, b) => a - b);
+  const latency: Record<string, number> = { under_5m: 0, under_1h: 0, under_1d: 0, older: 0 };
+  for (const n of ms) latency[n < 5 * 60e3 ? "under_5m" : n < 3600e3 ? "under_1h" : n < 86400e3 ? "under_1d" : "older"]++;
+  const medianMs = ms.length ? (ms.length % 2 ? ms[(ms.length - 1) / 2] : (ms[ms.length / 2 - 1] + ms[ms.length / 2]) / 2) : null;
+  const tally = (f: (m: (typeof ownerReplied)[number]) => string) => {
+    const o: Record<string, number> = {};
+    for (const m of ownerReplied) { const k = f(m) || "unknown"; o[k] = (o[k] ?? 0) + 1; }
+    return o;
+  };
   const out = {
     shadow_judge: judgeAccuracy(),
     shadow_judge_by_agent: Object.fromEntries(Object.keys(per).map((a) => [a, judgeAccuracy(a)])), proposal_batches: approvals.length, proposals_rejected_total: rejected,
     window_days: days, generated: new Date().toISOString(), agents,
     decisions: { total: decisions.length, by_judge: byWho(/^judge/), by_owner: byWho(/^owner\(/), owner_overrides_of_judge: byWho(/override/),
-      owner_accepted_recommendation: rubberStamp },
+      owner_accepted_recommendation: rubberStamp,
+      reply_latency: { sampled: ms.length, median_minutes: medianMs == null ? null : Math.round(medianMs / 60e3), buckets: latency },
+      by_channel: tally((m) => String(m.answered_channel ?? "")), by_via: tally((m) => String(m.answered_via ?? "")) },
   };
   writeFileSync(P("fleet", "metrics.json"), JSON.stringify(out, null, 2));
   return out;

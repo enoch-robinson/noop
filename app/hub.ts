@@ -1,7 +1,10 @@
 // noop: the server's shapes and the pure logic of the timeline (no UI, no I/O), shared by App.tsx and the tests.
 import { L } from "./i18n";
 
-export type Kind = "notice" | "decision" | "menu" | "proposals" | "login" | "owner" | "system";
+export type Kind = "notice" | "decision" | "menu" | "proposals" | "login" | "owner" | "system" | "resolved";
+
+/** Structured card options as the hub sends them (mirrors the server's CardOption). */
+export type CardChoice = { key: string; label: string; consequence?: string; recommended?: boolean; risk?: "high" };
 
 export type HubEvent = {
   id: string;
@@ -14,6 +17,10 @@ export type HubEvent = {
   /** Said inside a task's own conversation: on the task page, not in the main channel. */
   thread?: boolean;
   options?: string[];
+  choices?: CardChoice[];
+  /** A resolved event: how the card ended (answered / ignored / overridden / snoozed / superseded) and by whom. */
+  state?: string;
+  by?: string;
   attachments?: string[];
 };
 
@@ -98,10 +105,13 @@ export function recommended(e: HubEvent): string | null {
 
 export const choiceLabel = (c: string) => (c === "all" ? L("All", "全部") : c === "none" ? L("None", "都不要") : c);
 
-/** The ids the owner has already answered, from the owner's own messages. */
+/** The ids the owner has already answered, from the owner's own messages and the hub's resolved events
+ *  (cards answered from Slack, Discord, the web card page or ntfy close here too). A snoozed card is NOT closed —
+ *  it stays open and its buttons must stay usable until the tick re-presents it or it is answered. */
 export function answeredIds(events: HubEvent[]): Set<string> {
   const done = new Set<string>();
   for (const e of events) {
+    if (e.kind === "resolved" && e.ref && e.state !== "snoozed") done.add(e.ref);
     if (e.kind !== "owner") continue;
     if (e.ref) done.add(e.ref);
     const m = e.text.match(LEADING_ID);
@@ -109,6 +119,29 @@ export function answeredIds(events: HubEvent[]): Set<string> {
   }
   return done;
 }
+
+/** When a card was resolved — a resolved event, else the owner's own answer message — for the amend window. */
+export function resolvedTsOf(events: HubEvent[], ref: string): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind === "resolved" && e.ref === ref) return e.ts;
+    if (e.kind === "owner" && (e.ref === ref || e.text.match(LEADING_ID)?.[1] === ref)) return e.ts;
+  }
+  return null;
+}
+
+/** How the card ended according to the hub's resolved events ("answered"…), or null while no closure arrived. */
+export function resolvedStateOf(events: HubEvent[], ref: string): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind === "resolved" && e.ref === ref) return e.state ?? "answered";
+  }
+  return null;
+}
+
+/** The card's option is gated (merge / release / deploy): the app confirms before sending it. */
+export const isRisky = (e: HubEvent, key: string) =>
+  !!e.choices?.some((o) => o.key.toUpperCase() === key.toUpperCase() && o.risk === "high");
 
 export { answerOf } from "./answers";
 

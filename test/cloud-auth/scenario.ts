@@ -58,7 +58,30 @@ const wsBad = await new Promise<boolean>((res) => {
   w.onopen = () => { w.close(); res(true); }; w.onerror = () => res(false); setTimeout(() => res(false), 5000);
 });
 ok(!wsBad, "WebSocket with bogus token refused");
+// /api/answer: the one endpoint every channel's buttons post to (owner session; machines never answer)
+ok((await post("/api/answer", { card: "D-0012", choice: "A" })).status === 401, "answer without credential → 401");
+ok((await post("/api/answer", { card: "D-0012", choice: "A" }, { authorization: `Bearer ${TOKEN}` })).status === 403, "machine token cannot answer");
+ok((await post("/api/answer", { card: "X-1", choice: "A" }, auth)).status === 400, "bad card id → 400");
+ok((await post("/api/answer", { card: "D-0012", choice: "" }, auth)).status === 400, "empty choice → 400");
+ok((await post("/api/answer", { card: "d-0012", choice: "A" }, auth)).status === 200, "answer (owner session, lowercase card normalized) → 200");
+ok((await post("/api/answer", { card: "D-0012", choice: "A" }, auth)).status === 200, "duplicate click accepted: idempotency is decided by the fleet (inbox dedupe + closed card), not the API");
 ok((await post("/api/host/revoke-sessions", {}, auth)).status === 403, "session cannot revoke-sessions");
+// channel button callbacks: their own signature auth outside the Bearer gate; unconfigured → 503, configured → 403 on garbage
+ok([503, 403].includes((await post("/api/slack/interactive", {})).status), "slack interactive: unconfigured → 503, else invalid signature → 403");
+ok([503, 403].includes((await post("/api/discord/interactive", { type: 1 })).status), "discord interactive: unconfigured → 503, else invalid signature → 403");
+ok((await post("/api/answer", { card: "D-0012", choice: "A" }, { authorization: "Bearer not-a-real-token" })).status === 401,
+  "answer-token gate: an unknown bearer never reaches /api/answer");
+ok((await post("/api/host/join", {}, { authorization: `Bearer ${"b".repeat(40)}` })).status === 401,
+  "unknown bearer cannot reach /api/host/join (which returns HUB_TOKEN)");
+// the full answer-token contract (POST /api/answer only, nothing else) needs the real token: pass ANSWER_TOKEN=<hex>
+const ANSWER = process.env.ANSWER_TOKEN;
+if (ANSWER) {
+  ok((await post("/api/answer", { card: "D-0012", choice: "A" }, { authorization: `Bearer ${ANSWER}` })).status === 200, "answer token answers /api/answer");
+  ok((await post("/api/host/join", {}, { authorization: `Bearer ${ANSWER}` })).status === 401, "answer token CANNOT reach /api/host/join");
+  ok((await fetch(BASE + "/api/files/read?path=memory/lessons.md", { headers: { authorization: `Bearer ${ANSWER}` } })).status === 401, "answer token cannot read files");
+  ok((await fetch(BASE + "/api/status", { headers: { authorization: `Bearer ${ANSWER}` } })).status === 401, "answer token cannot read status/feed");
+  ok((await post("/api/messages", { text: "x" }, { authorization: `Bearer ${ANSWER}` })).status === 401, "answer token cannot post owner messages");
+}
 ok((await post("/api/auth/logout", {}, auth)).status === 200, "logout → 200");
 ok((await fetch(BASE + "/api/status", { headers: auth })).status === 401, "after logout → 401");
 

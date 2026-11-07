@@ -6,8 +6,9 @@ import {
   type Cfg, P, ROOT, _commitPush, _pull, agentName, chooseCli, claim, commitPush, heartbeat, hostCaps, hostName, journal,
   list, loadConfig, locked, newTask, now, onlineHosts, pickTask, pull, readDoc, remember, writeDoc,
 } from "./core";
-import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, overrideJudge, recentJudgeIds, routeDecision } from "./decisions";
-import { notify, openDecisionIds, pollReplies } from "./notify";
+import { amendDecision, arbitrateReply, closeDecision, IGNORE, holdNotify, ignoreDecision, openDecision, overrideJudge, parseOptions, recentJudgeIds, refuseHighRiskWords, routeDecision, snoozeDecision, summarizeOpenCards, wakeDue } from "./decisions";
+import { parseChoice } from "./reply-parse";
+import { notify, openDecisionIds, pollReplies, resolveReceipt } from "./notify";
 import { STALLED, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent } from "./runner";
 import { byName, CLIS } from "./clis";
 import { writeRules } from "./rules";
@@ -22,7 +23,7 @@ import { collect, LEARN_PROMPT } from "./sessions";
 import { medic } from "./medic";
 import { githubStarved } from "./github";
 import { doctor, visual } from "./visual";
-import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
+import { answerFromChat, AMEND_MS, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
 import { followUpTarget, reopenTask, type BrainOut, ClaudeModel, SYSTEM, dataActs, localStore, logBrain, think } from "./brain";
 import { runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
@@ -242,15 +243,16 @@ async function processTask(path: string, cfg: Cfg, host: string) {
 
 const FOLLOW_UP = "## Owner follow-up";
 
-async function handleReplies(cfg: Cfg, host: string) {
+export async function handleReplies(cfg: Cfg, host: string) {
   const open = openDecisionIds();
   const judged = recentJudgeIds();
   const replies = [...drainInbound(), ...await pollReplies(cfg, new Set([...open, ...judged, ...pendingLoginIds()]))];
   for (const r of replies) {
     if (r.id.startsWith("P-")) {
-      if (resolveProposals(r.id, r.answer, `owner(${r.source})`)) {
+      if (resolveProposals(r.id, r.answer, `owner(${r.source})`, r.via)) {
         journal(host, `${r.id} owner approved: ${r.answer}`);
         await notify(`${r.id} 已按你的选择排队`, cfg);
+        void resolveReceipt(r.id, cfg, r.answer, `owner(${r.source})`);
       }
       continue;
     }
@@ -266,19 +268,66 @@ async function handleReplies(cfg: Cfg, host: string) {
       } else await handleOwnerMessage(r.answer, undefined, true);
       continue;
     }
+    const snooze = r.answer.trim().match(/^(稍后|snooze)\s*(\d+)\s*(m|分|h|小时|小時)?/i);
     if (open.has(r.id) && r.answer.trim() === IGNORE) {
-      ignoreDecision(r.id, `owner(${r.source})`);
+      ignoreDecision(r.id, `owner(${r.source})`, r.via);
       journal(host, `🙈 ${r.id} owner ignored it`);
       await notify(`已忽略 ${r.id}：任务继续，由 agent 自己判断，不再追问`, cfg);
+      void resolveReceipt(r.id, cfg, IGNORE, `owner(${r.source})`);
+    } else if (open.has(r.id) && snooze) {
+      // 稍后 [30m|2h]: the card stays open and the tick re-presents it; default honors the renotify interval
+      const mins = snooze[2] ? Number(snooze[2]) * (snooze[3] && /^h/i.test(snooze[3]) ? 60 : 1)
+        : (cfg.autonomy?.renotify_hours ?? 3) * 60;
+      snoozeDecision(r.id, mins, `owner(${r.source})`);
+      journal(host, `⏰ ${r.id} snoozed for ${Math.round(mins / 60)}h`);
+      await notify(`已推迟 ${r.id}，${mins >= 60 ? `${Math.round(mins / 60)} 小时` : `${mins} 分钟`}后会再提醒（任务继续等着）`, cfg);
     } else if (open.has(r.id)) {
-      closeDecision(r.id, r.answer, `owner(${r.source})`);
-      journal(host, `✔ ${r.id} owner answered via ${r.source}: ${r.answer}`);
-      await notify(`收到 ${r.id}：${r.answer} — 任务已重新排队`, cfg);
+      // the set was taken before the loop: an earlier reply in this same batch may have closed the card already
+      const f = P("decisions", "open", `${r.id}.md`);
+      if (!existsSync(f)) continue;
+      // typed replies are read as forgivingly as they are typed: a key, a key list or one unambiguous label is a
+      // choice; anything else goes to the brain (arbitrateReply), which maps it or asks — never a guess
+      const parsed = parseChoice(r.answer, parseOptions(readDoc(f).meta));
+      if ("unrecognized" in parsed) {
+        journal(host, `💬 ${r.id} 自由文本（未直接对应选项）: ${r.answer}`);
+        await arbitrateReply(r.id, r.answer, cfg, host, r.source, r.via);
+      } else {
+        // a fragment ("先 merge 再说") is the fuzzy reading — it must not unlock a merge/release, same as the brain
+        // path; an exact key or the full label echo is the deliberate typed confirmation and closes as before
+        const opt = parsed.how === "fragment" ? parseOptions(readDoc(f).meta).find((o) => o.key === parsed.choice) : undefined;
+        if (opt?.risk === "high") {
+          await refuseHighRiskWords(r.id, opt, r.answer, cfg, host);
+          continue;
+        }
+        const answer = parsed.choice;
+        closeDecision(r.id, answer, `owner(${r.source})`, undefined, r.via);
+        journal(host, `✔ ${r.id} owner answered via ${r.source}: ${answer}`);
+        await notify(`收到 ${r.id}：${answer} — 任务已重新排队`, cfg);
+        void resolveReceipt(r.id, cfg, answer, `owner(${r.source})`);
+      }
+    } else if (r.id.startsWith("D-") && /^(override|veto)\b/i.test(r.answer.trim())) {
+      // a judge-ruled card can still be vetoed — this must come BEFORE the already-closed drop below, or the
+      // text protocol could never reach overrideJudge (the receipt card's button posts the bare keyword)
+      const answer = r.answer.trim().replace(/^(override|veto)[\s:：]*/i, "").trim() || "否决，请重新决定";
+      if (overrideJudge(r.id, answer, r.source, host, r.via)) {
+        await notify(`已否决 ${r.id}：judge 的代答作废，已记入 feedback 并创建重做任务`, cfg);
+        void resolveReceipt(r.id, cfg, answer, `owner-override(${r.source})`);
+      } else await notify(`无法否决 ${r.id}：它不是 judge 代答的卡，答案不变`, cfg);
     } else if (r.id.startsWith("D-") && existsSync(P("decisions", "closed", `${r.id}.md`))) {
-      // a reply to a card that is already answered: say so in the journal instead of dropping it silently
-      journal(host, `↩️ ${r.id} 已经答过，这次的重复回复被忽略`);
-    } else if (/^override\b/i.test(r.answer) && overrideJudge(r.id, r.answer.replace(/^override[\s:：]*/i, ""), r.source, host)) {
-      await notify(`已记录你对 ${r.id} 的纠正，judge 以后会参考；已创建重做任务`, cfg);
+      // a reply moments after the answer is a correction ("D-0012 其实选 B"), not a repeat: amend while the window is
+      // open — the app's 修改 button (and a chat follow-up) lands here; past the window it is a new instruction
+      const m = readDoc(P("decisions", "closed", `${r.id}.md`)).meta;
+      if (m.amended && Date.now() - Date.parse(m.amended) < AMEND_MS) {
+        // a polled channel message re-arrives every tick: one correction per window, the repeats are noise
+        journal(host, `↩️ ${r.id} 刚刚更正过，这条重复回复被忽略`);
+      } else if (m.answered && Date.now() - Date.parse(m.answered) < AMEND_MS) {
+        const tid = amendDecision(r.id, r.answer, `owner(${r.source})`);
+        if (tid) {
+          journal(host, `✏️ ${r.id} owner corrected: ${r.answer}`);
+          await notify(`已按你的纠正更新 ${r.id}（${tid}），之前的选择作废`, cfg);
+          void resolveReceipt(r.id, cfg, r.answer, `owner(${r.source}) 改答`);
+        } else await handleOwnerMessage(r.answer, undefined, true); // no linked task: it is just a chat message
+      } else journal(host, `↩️ ${r.id} 已经答过，这次的重复回复被忽略`);
     }
   }
 }
@@ -585,6 +634,8 @@ export async function tick(cfg: Cfg, background = false) {
   pruneMediaHourly(cfg);
   await retryLogins(cfg);
   if (primary || pendingLoginIds().size) await handleReplies(cfg, host);
+  if (primary) for (const id of wakeDue()) await holdNotify(id, cfg, host); // snoozed cards come back on their own
+  if (primary) await summarizeOpenCards(cfg, host).catch((e) => console.error(`summary: ${e}`));
   if (primary) await planInbox(cfg, host);
   if (primary) {
     const toRoute = [...pendingRoute.splice(0), ...list(P("decisions", "open")).map((p) => readDoc(p).meta)

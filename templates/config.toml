@@ -115,6 +115,11 @@ host = "0.0.0.0"                      # reach it via Tailscale (MagicDNS name = 
 [notify]
 on_failure = true
 # ntfy_url = "http://<primary>:2586/agent-hub"   # optional phone push (self-hosted ntfy or ntfy.sh topic)
+# Decision cards become tappable buttons on every configured channel: ntfy banner buttons post the answer-only
+# token below; Slack/Discord buttons fire the callbacks below and need one redeploy after filling these in.
+# ntfy_answer_token = ""               # `hub cloud deploy` generates one automatically and writes it here
+# slack_signing_secret = ""           # Slack app → Interactive Components → signing secret (button clicks verify)
+# discord_public_key = ""             # Discord app → Interactions endpoint → public key (hex; button clicks verify)
 # Put tokens in config.local.toml or env (HUB_SLACK_BOT_TOKEN / HUB_DISCORD_BOT_TOKEN ...)
 # slack_channel = "C0123456"
 # discord_channel = "123456789012345678"

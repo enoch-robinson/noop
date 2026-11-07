@@ -97,7 +97,7 @@ export function startCloudBridge(cfg: Cfg) {
       after = it.seq; saveCursor(); // before handling, so a restart mid-message doesn't replay it
       if (!fresh) return;
       appendEvent(e, { mirror: false }); // keep the local record (learning reads it); the cloud already has it
-      await handleOwnerMessage(e.text, e.ref, false, { paths: e.attachments, key: e.id, fetch: (p) => cloudMedia(cfg, p), sentAt: e.ts, thread: e.thread });
+      await handleOwnerMessage(e.text, e.ref, false, { paths: e.attachments, key: e.id, fetch: (p) => cloudMedia(cfg, p), sentAt: e.ts, thread: e.thread, via: typeof e.via === "string" ? e.via : undefined });
     } else if (it.type === "op" && it.op) {
       await applyOp(it.op);
     } else if (it.type === "cancel" && typeof it.id === "string") {
@@ -204,6 +204,23 @@ export async function cloudDeploy(cfg: Cfg) {
   const vapid = await vapidKeys();
   secrets.HUB_VAPID_PUBLIC = vapid.publicKey;
   secrets.HUB_VAPID_PRIVATE = JSON.stringify(vapid.privateJwk);
+  // Channel button callbacks: Slack/Discord verification keys come from [notify] (hand-set); the ntfy banner
+  // buttons need an answer-only token because their Actions header passes it through the ntfy server (a third
+  // party) — never HUB_TOKEN. It is generated once and kept in the shared config.toml [notify]: leaking it lets a
+  // holder answer cards, nothing more (Worker enforces answer-only; see HUB_ANSWER_TOKEN in cloud/src/index.ts).
+  let pendingAnswerToken = "";
+  const n = cfg.notify ?? {};
+  if (n.slack_signing_secret) secrets.HUB_SLACK_SIGNING_SECRET = String(n.slack_signing_secret);
+  if (n.discord_public_key) secrets.HUB_DISCORD_PUBLIC_KEY = String(n.discord_public_key);
+  if (n.ntfy_url) {
+    const tok = String(n.ntfy_answer_token ?? "");
+    if (/^[0-9a-f]{32,}$/.test(tok)) secrets.HUB_ANSWER_TOKEN = tok;
+    else {
+      if (tok) console.log(`警告：config 里现有的 ntfy_answer_token 格式无效，已生成新令牌写入共享 config.toml；请删除 config.local.toml 里的旧值（它会覆盖共享配置）`);
+      pendingAnswerToken = [...crypto.getRandomValues(new Uint8Array(32))].map((x) => x.toString(16).padStart(2, "0")).join("");
+      secrets.HUB_ANSWER_TOKEN = pendingAnswerToken;
+    }
+  }
   // `secret bulk` reads JSON from stdin — values never touch argv or the console.
   const sec = Bun.spawn([...wr, "secret", "bulk", "--name", name], { cwd: dir, env, stdin: new Blob([JSON.stringify(secrets)]), stdout: "pipe", stderr: "pipe" });
   if ((await sec.exited) !== 0) return fail("设置 Worker 密钥失败：\n" + (await new Response(sec.stderr).text()).slice(-800));
@@ -217,6 +234,13 @@ export async function cloudDeploy(cfg: Cfg) {
     // keep the account too: without it the primary's next redeploy (on every update) may land in another account
     const block = `[cloud]\nurl = "${url}"\nname = "${name}"\n${account ? `account = "${account}"\n` : ""}${domain ? `domain = "${domain}"\n` : ""}`;
     s = /^\[cloud\]/m.test(s) ? s.replace(/^\[cloud\][^\[]*/m, `${block}\n`) : `${s.trimEnd()}\n\n${block}`;
+    if (pendingAnswerToken) { // new banner-button token: record it where notify() reads it, so restarts reuse it
+      const line = `ntfy_answer_token = "${pendingAnswerToken}"`;
+      s = /^\s*ntfy_answer_token\s*=/m.test(s) ? s.replace(/^\s*ntfy_answer_token\s*=.*$/m, line)
+        : /^\[notify\]/m.test(s) ? s.replace(/^\[notify\][^\[]*/m, (b) => `${b.trimEnd()}\n${line}  # banner buttons: can only answer cards; safe in the shared config (or move to config.local.toml)\n\n`)
+        : `${s.trimEnd()}\n\n[notify]\n${line}\n`;
+      console.log(`已生成 ntfy 按钮令牌并写入共享 config.toml；重启 hub 后横幅按钮生效`);
+    }
     writeFileSync(f, s);
     writeFileSync(P("README.md"), `# noop data\n\n私有数据（保存在你自己的 Cloudflare Worker 里）：任务、决策、记忆、日志。\n\n## 客户端\n\n地址：**${url}**\n\n打开后粘贴 token 连接（或用邮箱验证码登录；机器 token 在主机的 ~/.noop/noop.toml 里）。这个地址部署在你自己的 Cloudflare 账号里，固定不变。\n`);
     journal(hostName(cfg), `☁️ cloud hub deployed: ${url}`);

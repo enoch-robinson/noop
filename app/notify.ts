@@ -35,6 +35,9 @@ export function notificationFor(ev: NotifyEvent, prefs: NotifyRules, now = new D
   const kind = ev.kind;
   if (!KINDS.includes(kind)) return null; // never system / owner
   if (kind === "notice" && /^hub(@|$)/.test(String(ev.from ?? ""))) return null; // hub's own housekeeping
+  // a judge receipt ("judge 已代答 …" + the veto button) is quiet by design: the answer itself is the news,
+  // and the card stays interactive in the feed — it just never buzzes the owner's phone
+  if (kind === "decision" && /^judge(@|$)/.test(String(ev.from ?? ""))) return null;
   // Settings call notices "results".
   if (prefs.kinds?.[kind === "notice" ? "result" : kind] === false) return null;
   const urgent = kind === "decision" && ev.priority === "urgent";
