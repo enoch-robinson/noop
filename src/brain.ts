@@ -8,6 +8,7 @@
 // owner messages reach this daemon over the existing owner→fleet inbox (long-polled, so within milliseconds), and the
 // reply goes back as a normal feed event.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { channelPrompt } from "./channels";
 import { join, relative } from "node:path";
 import { DATA, HOME_DIR, P, _commitPush, _pull, journal, locked, now, readDoc, writeDoc } from "./core";
 import { type Ev, type FileRow, type ToolStore, type WriteOp, isWrite, listDecisions, listRoutines, listTasks, editMemoryEntry, runTool, toolsFor, writeOp } from "../cloud/src/tools";
@@ -229,6 +230,8 @@ export function context(st: ToolStore, m: BrainIn): string {
   const s = st.status() ?? {};
   return [
     `Now: ${new Date().toISOString()}`,
+    channelPrompt(),
+    "When calling create_task, set channels by these goals. Existing slugs or {name, goal} for a new work topic; [] for none.",
     `Routines: ${listRoutines(st).map((r) => `${r.name} (${r.every ?? r.at ?? "?"}, ${r.agent}${r.enabled ? "" : ", off"})`).join("; ") || "(none)"}`,
     `Machines online: ${(s.hosts ?? []).filter((h: any) => h.online !== false).map((h: any) => h.host).join(", ") || "unknown"}`,
     `Open tasks:\n${open.map((t) => `- ${t.id} [${t.state}${t.agent ? `, ${t.agent}` : ""}${t.host ? ` on ${t.host}` : ""}${t.priority ? `, ${t.priority}` : ""}] ${t.title}`).join("\n") || "(none)"}`,

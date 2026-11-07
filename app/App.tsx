@@ -38,7 +38,7 @@ import {
 import fs from "fs/promises";
 import type { InputRef, JSX, SpeechSession, ViewStyle } from "nsh";
 import { AlertDialog, Button, ContextMenu, Dialog, Menu, MenuItem, MenuSeparator, Submenu, Input, NavPage, NavStack, NumberInput, Radio, RadioGroup, Scrollbar, TextView, createNavStack, type MarkdownExtension, type TextViewBlock, type TextViewCustomNode, type TextViewInline, type TextViewRef } from "nsh/base";
-import { isAvailable as hasWindow, titleBar, Window } from "nsh/desktop";
+import { isAvailable as hasWindow, titleBar, currentWindow } from "nsh/desktop";
 import { checkForPackage, checkForUpdate, downloadPackage, downloadUpdate, installAndRestart, restartToPackage, runningPackage } from "nsh/updater";
 // shellInfo through the namespace: runtimes older than it lack the export, and a missing named import would fail to link
 import * as nshUpdater from "nsh/updater";
@@ -46,7 +46,8 @@ import { CLIENT_VERSION } from "./version";
 import { createSettingsToast, SettingsToast } from "./settings-toast";
 import { agentDisplayName, avatarOf } from "./avatars";
 import { CheckMark } from "./ui/icons";
-import { type Channel, parseSeen, sortChannels, unreadIn, type SeenMap } from "./channels";
+import { type Channel, sortChannels } from "./channels";
+import { isRead, markRead, unreadEvents, toggleMessageRead, type MessageReadState as ReadState } from "./read";
 import { appendQuote } from "./quote";
 import { setupTray, type TrayChat } from "./tray";
 import { createTimelineWindow } from "./timeline";
@@ -1032,7 +1033,7 @@ function askLine(text: string): string {
 
 /** A message's quick actions under it (like ChatGPT's): copy its text, reply to what it is about. Shown on hover
  * on a desktop, always on a phone (no hover there). */
-function MsgActions(props: { text: string; show: () => boolean; onReply?: () => void; align?: "flex-start" | "flex-end"; id: string }) {
+function MsgActions(props: { text: string; show: () => boolean; onReply?: () => void; align?: "flex-start" | "flex-end"; id: string; unread?: () => boolean; onToggleRead?: () => void }) {
   const copied = signal(false);
   let t: ReturnType<typeof setTimeout> | undefined;
   cleanup(() => clearTimeout(t));
@@ -1052,6 +1053,11 @@ function MsgActions(props: { text: string; show: () => boolean; onReply?: () => 
       <If when={props.onReply}>
         <View role="button" testID={`reply-${props.id}`} accessibilityLabel={L("Reply", "回复")} onPress={() => props.onReply?.()} hoverStyle={hovered()} style={btn()}>
           <Icon name="reply" size={18} tint={colors.muted} />
+        </View>
+      </If>
+      <If when={props.onToggleRead}>
+        <View role="button" testID={`toggle-read-${props.id}`} accessibilityLabel={props.unread?.() ? L("Mark as read", "标为已读") : L("Mark as unread", "标为未读")} onPress={() => props.onToggleRead?.()} hoverStyle={hovered()} style={{ ...btn(), width: undefined, paddingHorizontal: 8 }}>
+          <Text style={{ fontSize: size.tiny, fontWeight: "600", color: colors.muted }}>{props.unread?.() ? L("Mark read", "标为已读") : L("Mark unread", "标为未读")}</Text>
         </View>
       </If>
     </View>
@@ -1160,6 +1166,9 @@ function Message(props: {
   onReply: (ref: string, note?: string) => void;
   onQuote?: (markdown: string, ref?: string) => void;
   selection?: Map<string, Signal<Set<string>>>;
+  /** Unread on this device; the dot by the name and the action under the message. */
+  unread?: () => boolean;
+  onToggleRead?: () => void;
 }) {
   const e = props.event;
   const selection = props.selection ?? new Map<string, Signal<Set<string>>>();
@@ -1223,6 +1232,7 @@ function Message(props: {
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: 22 }}>
           <If when={!wide()}><Avatar testID={`avatar-inline-${e.id}`} from={e.from} small /></If>
           <Text style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>{displayName(e.from)}</Text>
+          <If when={props.unread?.()}><View testID={`unread-dot-${e.id}`} accessibilityLabel={L("Unread", "未读")} style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: colors.accentFill }} /></If>
           <Text style={{ fontSize: size.tiny, color: colors.faint, fontVariant: ["tabular-nums"] }}>{timeOf(e.ts)}</Text>
           {tag && !ask ? <Badge label={tag} /> : null}
         </View>
@@ -1292,7 +1302,7 @@ function Message(props: {
           body
         )}
         <If when={e.text.trim()}>
-          <MsgActions id={e.id} text={e.text} show={() => touch || over()} onReply={e.ref && !(ask && !done()) ? () => props.onReply(e.ref!, replyable ? firstLine(e.text) : undefined) : undefined} />
+          <MsgActions id={e.id} text={e.text} show={() => touch || over() || !!props.unread?.()} unread={props.unread} onToggleRead={props.onToggleRead} onReply={e.ref && !(ask && !done()) ? () => props.onReply(e.ref!, replyable ? firstLine(e.text) : undefined) : undefined} />
         </If>
       </View>
     </View>
@@ -1332,30 +1342,63 @@ function since(iso?: string, end?: string): string {
 
 const HISTORY_PAGE = 50;
 
-const SEEN_KEY = "noop.channels.seen", SINCE_KEY = "noop.channels.since";
-
-/** The channels list, kept fresh while the app is open, and when each was last opened on this device. */
-function createChannels(hub: Hub) {
-  const list = signal<Channel[]>([]);
-  const seen = signal<SeenMap>({});
-  const since = signal(new Date().toISOString());
-  void (async () => {
-    seen.set(parseSeen(await Storage.getItem(SEEN_KEY)));
-    const s = await Storage.getItem(SINCE_KEY);
-    if (s) since.set(s); else void Storage.setItem(SINCE_KEY, untracked(since));
-  })();
-  const load = async () => {
-    const r = await hub.api("GET", "/api/channels").catch(() => null);
-    if (r?.ok && Array.isArray(r.data.channels)) list.set(sortChannels(r.data.channels as Channel[]));
+/** One event read record, shared by all views on this device. The old chat watermark migrates once. */
+function createMessageReads(hub: Hub) {
+  const state = signal<ReadState>({ through: "", ids: [], marked: [] });
+  const loaded = signal(false);
+  const key = `hub.read:${hub.cfg.url}`;
+  let saving = Promise.resolve();
+  Promise.all([Storage.getItem(key), Storage.getItem(KEYS.seen), Storage.getItem("hub.markedUnread")]).then(([raw, old, marked]) => {
+    let next: ReadState = { through: old ?? "", ids: [], marked: [] };
+    try { const marks = JSON.parse(marked ?? "[]"); if (Array.isArray(marks)) next.marked = marks.filter((v: unknown) => typeof v === "string"); } catch {}
+    try { const j = JSON.parse(raw ?? "null"); if (j && typeof j.through === "string" && Array.isArray(j.ids)) next = { through: j.through, ids: j.ids.filter((id: unknown) => typeof id === "string"), marked: Array.isArray(j.marked) ? j.marked.filter((v: unknown) => typeof v === "string") : next.marked }; } catch {}
+    state.set(next); loaded.set(true);
+  });
+  const persist = (next: ReadState) => { state.set(next); saving = saving.then(async () => { await Storage.setItem(key, JSON.stringify(next)); await Storage.setItem("hub.markedUnread", JSON.stringify(next.marked ?? [])); }).catch(() => {}); };
+  const read = (events: HubEvent[], explicit = false) => {
+    if (!untracked(loaded)) return;
+    const old = untracked(state);
+    const marks = explicit ? (old.marked ?? []).filter((id) => !events.some((e) => e.id === id)) : old.marked;
+    const base = marks?.length !== old.marked?.length ? { ...old, marked: marks } : old;
+    const next = markRead(base, events);
+    if (next !== old) persist(next);
   };
-  void load();
-  const timer = setInterval(() => void load(), 60_000);
-  cleanup(() => clearInterval(timer));
+  const unread = computed(() => loaded() ? unreadEvents(hub.events(), state()) : []);
+  return { loaded, state, read, unread,
+    ref: (id: string) => read(untracked(hub.events).filter((e) => e.ref === id), true),
+    toggle: (e: HubEvent) => persist(toggleMessageRead(untracked(state), e)),
+    all: () => persist({ through: untracked(hub.events).reduce((ts, e) => e.ts > ts ? e.ts : ts, untracked(state).through), ids: [], marked: [] }),
+  };
+}
+type MessageReads = ReturnType<typeof createMessageReads>;
+
+/** Channel snapshots refresh from pushed task/channel revisions, never on a timer. */
+function createChannels(hub: Hub, reads: MessageReads) {
+  const list = signal<Channel[]>([]);
+  let generation = 0;
+  const load = async () => {
+    const mine = ++generation;
+    const r = await hub.api("GET", "/api/channels").catch(() => null);
+    if (mine === generation && r?.ok && Array.isArray(r.data.channels)) list.set(sortChannels(r.data.channels as Channel[]));
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let revision = "";
+  effect(() => {
+    const st = hub.status();
+    const next = JSON.stringify([st?.channels_revision, st?.tasks, st?.decisions, st?.recent?.map((t) => [t.id, t.updated])]);
+    if (next === revision) return;
+    revision = next;
+    clearTimeout(timer); timer = setTimeout(() => void load(), 150);
+  });
+  cleanup(() => { clearTimeout(timer); generation++; });
   return {
-    list, load,
-    unread: (c: Channel) => unreadIn(c, seen(), since()),
-    open: (slug: string) => { const next = { ...untracked(seen), [slug]: new Date().toISOString() }; seen.set(next); void Storage.setItem(SEEN_KEY, JSON.stringify(next)); },
+    list, load, reads,
+    unread: (c: Channel) => {
+      const refs = new Set(c.refs ?? c.items.filter((i) => i.kind !== "report").map((i) => i.id));
+      return reads.unread().filter((e) => !!e.ref && refs.has(e.ref)).length;
+    },
     async save(slug: string, patch: { goal?: string; archived?: boolean }) {
+      generation++;
       const r = await hub.api("POST", "/api/channels", { slug, ...patch });
       if (r.ok) list.set(sortChannels(untracked(list).map((c) => (c.slug === slug ? { ...c, ...(patch.goal !== undefined ? { goal: patch.goal } : {}), ...(patch.archived !== undefined ? { status: patch.archived ? "archived" : "active" } : {}) } : c))));
       return r.ok;
@@ -1365,20 +1408,20 @@ function createChannels(hub: Hub) {
 type Channels = ReturnType<typeof createChannels>;
 
 /** One channel: its goal (editable), archive, and the tasks and cards that belong to it, newest first. */
-function ChannelPage(props: { channels: Channels; slug: string; wide: boolean; onTask: (id: string) => void; onPick: (ref: string) => void }) {
+function ChannelPage(props: { channels: Channels; slug: string; wide: boolean; onTask: (id: string) => void; onPick: (ref: string) => void; onDoc: (path: string) => void }) {
   const ch = () => props.channels.list().find((c) => c.slug === props.slug);
   const editing = signal(false);
   const goal = signal("");
   const busy = signal(false);
-  props.channels.open(props.slug);
+
   const saveGoal = async () => {
     busy.set(true);
     if (await props.channels.save(props.slug, { goal: untracked(goal).trim() })) editing.set(false);
     busy.set(false);
   };
   return (
-    <Scroll testID="channel-page" style={{ flex: 1 }}>
-      <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", gap: 14, paddingHorizontal: props.wide ? 32 : 16, paddingVertical: 20 }}>
+    <View testID="channel-page" style={{ flex: 1 }}>
+      <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", flex: 1, gap: 14, paddingHorizontal: props.wide ? 32 : 16, paddingVertical: 20 }}>
         <If when={ch()} else={<Text style={{ fontSize: 14, color: colors.faint }}>{L("Loading…", "读取中…")}</Text>}>
           <View style={{ gap: 6 }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
@@ -1416,16 +1459,16 @@ function ChannelPage(props: { channels: Channels; slug: string; wide: boolean; o
               </View>
             </If>
           </View>
-          <View>
+          <View style={{ flex: 1 }}>
             <Text style={{ fontSize: 12, fontWeight: "600", color: colors.muted, letterSpacing: 0.4, paddingBottom: 6 }}>{L(`Items (${ch()!.count})`, `内容（${ch()!.count}）`)}</Text>
             <If when={!ch()!.items.length}><Text style={{ fontSize: 14, color: colors.faint }}>{L("Nothing here yet", "还没有内容")}</Text></If>
-            <Each of={ch()!.items} key={(i) => `${i.kind}:${i.id}`}>
+            <List each={ch()!.items} keyExtractor={(i) => `${i.kind}:${i.id}`} estimatedItemSize={44} style={{ flex: 1 }}>
               {(i) => (
                 <View
                   role="button"
                   testID={`channel-item-${i().id}`}
                   accessibilityLabel={`${i().id} ${i().title}`}
-                  onPress={() => (i().kind === "decision" && i().state === "open" ? props.onPick(i().id) : props.onTask(i().task ?? i().id))}
+                  onPress={() => { props.channels.reads.ref(i().kind === "report" ? i().task ?? i().id : i().id); if (i().kind === "report") props.onDoc(i().id); else if (i().kind === "decision" && i().state === "open") props.onPick(i().id); else props.onTask(i().task ?? i().id); }}
                   hoverStyle={hovered()}
                   style={{ minHeight: size.row, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 10, marginHorizontal: -10, borderRadius: 7 }}
                 >
@@ -1435,11 +1478,11 @@ function ChannelPage(props: { channels: Channels; slug: string; wide: boolean; o
                   <Text style={{ fontSize: 12.5, color: colors.faint, fontVariant: ["tabular-nums"] }}>{clock(i().updated)}</Text>
                 </View>
               )}
-            </Each>
+            </List>
           </View>
         </If>
       </View>
-    </Scroll>
+    </View>
   );
 }
 
@@ -1917,6 +1960,9 @@ function Sidebar(props: {
   onCollapse?: () => void;
   home: () => boolean;
   onHome: () => void;
+  /** Unread messages in the channel on this device, and reading them all. */
+  unread: () => number;
+  onReadAll: () => void;
   onRestart: () => void;
 }) {
   const s = () => props.hub.status();
@@ -1967,13 +2013,24 @@ function Sidebar(props: {
         {/* Keep intrinsic text widths from expanding the scrollable content. */}
         <View style={{ width: "100%", minWidth: 0, overflow: "hidden", paddingBottom: 16, gap: 1 }}>
           <View style={{ paddingTop: 8 }}>
+            <ContextMenu margin={8} popupStyle={menuStyle()} trigger={
             <SideRow onPress={props.onHome} selected={props.home()} title={L("Channel", "主会话")}>
               <Icon name="chat" size={17} tint={props.home() ? colors.text : colors.muted} />
               <Text style={{ ...rowText(), fontWeight: "600" }}>{L("Channel", "主会话")}</Text>
-              <If when={waits().length}>
+              <If when={waits().length && !props.unread()}>
                 <Text style={{ fontSize: 12.5, color: colors.faint, fontVariant: ["tabular-nums"] }}>{L(`${waits().length} to decide`, `${waits().length} 待决定`)}</Text>
               </If>
+              <If when={props.unread()}>
+                <View testID="channel-unread" accessibilityLabel={L(`${props.unread()} unread`, `${props.unread()} 条未读`)} style={{ minWidth: 20, height: 20, paddingHorizontal: 6, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: colors.accentFill }}>
+                  <Text style={{ fontSize: 12, fontWeight: "600", color: colors.onAccent, fontVariant: ["tabular-nums"] }}>{props.unread() > 99 ? "99+" : String(props.unread())}</Text>
+                </View>
+              </If>
             </SideRow>
+            }>
+              <MenuItem testID="read-all" disabled={!props.unread()} onSelect={props.onReadAll} hoverStyle={hovered()} style={{ height: touch ? 44 : 32, justifyContent: "center", paddingHorizontal: 10, borderRadius: 6 }}>
+                <Text style={{ fontSize: 14, color: props.unread() ? colors.text : colors.faint }}>{L("Mark all as read", "全部标为已读")}</Text>
+              </MenuItem>
+            </ContextMenu>
             <SideRow onPress={props.onRules} selected={props.rules()} title={L("Memory", "记忆")}>
               <Icon name="scroll" size={17} tint={props.rules() ? colors.text : colors.muted} />
               <Text style={rowText()}>{L("Memory", "记忆")}</Text>
@@ -2115,14 +2172,14 @@ function Sidebar(props: {
           paddingBottom: touch ? safeArea().bottom : 0,
         }}
       >
-        <UserMenu hub={props.hub} onSettings={props.onSettings} />
+        <UserMenu hub={props.hub} onSettings={props.onSettings} reads={props.channels.reads} />
       </View>
     </View>
   );
 }
 
 /** The sidebar account, opening the user menu (settings, appearance, language). */
-function UserMenu(props: { hub: Hub; onSettings: () => void }) {
+function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads }) {
   /** The signed-in account: its email, shown as the local part; the server address stays out of the UI. */
   const email = signal("");
   void Storage.getItem(KEYS.email).then((e) => email.set(e ?? ""));
@@ -2184,6 +2241,7 @@ function UserMenu(props: { hub: Hub; onSettings: () => void }) {
         >
           {avatar(24)}
           <Text testID="user-account" style={{ flex: 1, fontSize: 13, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{account() || L("Account", "账户")}</Text>
+          <If when={props.reads.unread().length}><Text testID="menu-unread-count" style={{ fontSize: 12, color: colors.accent }}>{String(props.reads.unread().length)}</Text></If>
           <Icon name="chevron-up" size={12} tint={colors.faint} />
         </View>
       }
@@ -2198,6 +2256,9 @@ function UserMenu(props: { hub: Hub; onSettings: () => void }) {
         </View>
       </View>
       {sep()}
+      <MenuItem testID="mark-all-read" disabled={!props.reads.unread().length} onSelect={props.reads.all} hoverStyle={hovered()} style={row()}>
+        {lead("check")}{label(L("Mark all as read", "全部已读"))}
+      </MenuItem>
       <MenuItem testID="settings" onSelect={props.onSettings} hoverStyle={hovered()} style={row()}>
         {lead("settings")}
         {label(L("Settings…", "设置…"))}
@@ -3692,7 +3753,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   const hub = props.hub;
   const settings = createSettings(hub);
   const push = createPush(hub, settings.toast.show);
-  const channels = createChannels(hub);
+  const reads = createMessageReads(hub);
+  const channels = createChannels(hub, reads);
   const wide = () => windowSize().width >= WIDE;
   const drawer = signal(false);
   const drawerDragging = signal(false);
@@ -3738,7 +3800,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   /** A task: from a machine's page it goes on top (back returns to the machine), else in place. */
   const openTask = (id: string) => {
     const t = untracked(top);
-    if (t.name === "host" || t.name === "tasks") { drawer.set(false); nav.push({ name: "task", id }); }
+    if (t.name === "host" || t.name === "tasks" || t.name === "topic") { drawer.set(false); nav.push({ name: "task", id }); }
     else show({ name: "task", id });
   };
   taskLink = openTask;
@@ -3776,10 +3838,17 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   // "以下为新消息": above the first event from others after what this device last saw.
   const seen = signal<string | null | undefined>(undefined);
   Storage.getItem(KEYS.seen).then((v) => seen.set(v ?? null));
+  const visibleMessages = signal<HubEvent[]>([]);
+  effect(() => {
+    if (!reads.loaded() || lifecycle() !== "active") return;
+    const route = top();
+    if (onChannel()) reads.read(visibleMessages());
+    else if (route.name === "task") { hub.events(); reads.ref(route.id); }
+  });
   const divider = signal<string | null | undefined>(undefined);
   effect(() => {
-    if (untracked(divider) !== undefined || !hub.loaded() || seen() === undefined) return;
-    divider.set(firstUnread(shown(), seen() ?? null));
+    if (untracked(divider) !== undefined || !hub.loaded() || seen() === undefined || !reads.loaded()) return;
+    divider.set(firstUnread(shown().filter((e) => !isRead(e, reads.state())), seen() ?? null));
   });
   // List diffs its items by identity: rebuilt rows would read as all replaced on every new message,
   // losing their measurements and the reader's place. Reuse each row while its event is the same.
@@ -4304,6 +4373,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       chrome={!inDrawer}
       onCollapse={inDrawer ? undefined : () => setSidebarOpen(false)}
       home={onChannel}
+      unread={() => reads.unread().length}
+      onReadAll={reads.all}
       onHome={() => { drawer.set(false); nav.popToRoot(); }}
     />
   );
@@ -4324,6 +4395,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
             <List
               testID="timeline"
               each={timeline()}
+              viewabilityConfig={{ minimumViewTime: 300 }}
+              onViewableItemsChange={({ viewableItems }) => visibleMessages.set(viewableItems.flatMap((t) => "event" in t.item ? [t.item.event] : []))}
               alignment="bottom"
               maintainVisibleContentPosition={{ autoscrollToBottomThreshold: AT_END }}
               estimatedItemSize={120}
@@ -4412,6 +4485,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                           onReply={reply}
                           onQuote={(text, ref) => excerpt.set({ text, ref })}
                           selection={proposalSelection}
+                          unread={() => reads.loaded() && !isRead(row.event, reads.state())}
+                          onToggleRead={() => reads.toggle(row.event)}
                         />
                       </View>
                     );
@@ -4750,7 +4825,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       case "channel": return channelPage();
       case "task": return <TaskDetail hub={hub} id={r.id} wide={wide()} />;
       case "tasks": return <TaskHistory hub={hub} wide={wide()} onTask={openTask} />;
-      case "topic": return <ChannelPage channels={channels} slug={r.slug} wide={wide()} onTask={openTask} onPick={pick} />;
+      case "topic": return <ChannelPage channels={channels} slug={r.slug} wide={wide()} onTask={openTask} onPick={pick} onDoc={(path) => nav.push({ name: "doc", path })} />;
       case "host": return <MachineDetail hub={hub} host={r.host} wide={wide()} onTask={openTask} />;
       case "team":
         return (
@@ -5158,8 +5233,7 @@ function Connected(props: { config: Config; openRef: string | null; onExpired: (
 
 function App() {
   if (hasWindow) {
-    Window.setTitle("Noop");
-    Window.setTitleBar({ style: "hidden", height: size.bar });
+    currentWindow().set({ title: "Noop", titleBar: { style: "hidden", height: size.bar } });
   }
   Scrollbar.setTheme(scrollbarTheme);
   watchUpdates();

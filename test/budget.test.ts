@@ -17,7 +17,8 @@ const INDEX_FACTOR = 3;
  *  owner app's status fetch on each reconnect. Each costs about two rows written where it writes at all. Button
  *  answers (Slack/Discord callbacks, ntfy http actions, /api/answer) need no line here: they are owner-triggered —
  *  one request per human click, and their inbox event rows are already counted with the owner sends below. */
-const OTHER_REQUESTS = (HOSTS.length * TASKS_PER_HOST * 2 + 96) + 50 * 3 + Math.ceil(DAY_MIN / 20) + 50;
+const CHANNEL_REQUESTS = (HOSTS.length * TASKS_PER_HOST * 2 + 1) * 3; // three owner clients, pushed membership changes only
+const OTHER_REQUESTS = CHANNEL_REQUESTS + (HOSTS.length * TASKS_PER_HOST * 2 + 96) + 50 * 3 + Math.ceil(DAY_MIN / 20) + 50;
 const OTHER_ROWS = (HOSTS.length * TASKS_PER_HOST * 2 + 96) * 2 + 50 * 6 + 2_000; // + events the fleet reports
 
 let W = "", t: sync.Transport;
@@ -33,6 +34,10 @@ test("a fleet day stays under the free-plan target", async () => {
   Object.assign(sync.syncTiming, { now: () => clock, pullMinMs: PULL_MIN_MS, lazyPushMs: LAZY_PUSH_MS });
   const dirs = Object.fromEntries(HOSTS.map((h) => { const d = join(W, h, "data"); mkdirSync(d, { recursive: true }); return [h, d]; }));
   const as = (h: string) => { sync.setSyncData(dirs[h]); sync.setTransport(t); return dirs[h]; };
+  for (const [h, d] of Object.entries(dirs)) {
+    mkdirSync(join(d, "channels"), { recursive: true });
+    writeFileSync(join(d, "channels", `${h}-quality.md`), `---\nname: ${h} quality\ngoal: Reliability\nstatus: active\n---\n`);
+  }
   const workAt = new Set(Array.from({ length: TASKS_PER_HOST }, (_, i) => Math.floor((i + 0.5) * DAY_MIN / TASKS_PER_HOST)));
 
   for (let minute = 0; minute < DAY_MIN; minute++) {
@@ -46,7 +51,7 @@ test("a fleet day stays under the free-plan target", async () => {
       if (workAt.has(minute)) { // one task: claimed, then finished a little later in the same minute, as a quick task would
         const id = `T-${i}${String(minute).padStart(4, "0")}`;
         mkdirSync(join(d, "tasks", "active"), { recursive: true }); mkdirSync(join(d, "tasks", "done"), { recursive: true });
-        writeFileSync(join(d, "tasks", "active", `${id}.md`), `---\nid: ${id}\n---\nwork\n`);
+        writeFileSync(join(d, "tasks", "active", `${id}.md`), `---\nid: ${id}\nchannels: ${h}-quality\n---\nwork\n`);
         await sync.pull(); expect(await sync.commitPush(`claim ${id}`)).toBe(true);
         appendFileSync(join(d, "journal", "2026-11-07.md"), `- ${minute} [${h}] ✅ ${id}\n`);
         renameSync(join(d, "tasks", "active", `${id}.md`), join(d, "tasks", "done", `${id}.md`));

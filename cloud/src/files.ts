@@ -114,7 +114,7 @@ export function pruneHistory(sql: FilesSql, now = Date.now(), dbBytes = 0) {
 }
 
 /** Prefixes the owner session may read (rules, memory, agent profiles, closed decisions). Never config / secrets. */
-export const READABLE = ["policies/", "memory/", "agents/", "decisions/closed/"] as const;
+export const READABLE = ["policies/", "memory/", "agents/", "decisions/closed/", "reports/"] as const;
 export const readable = (p: unknown): p is string => validPath(String(p ?? "").replace(/\/$/, "") || "x") && READABLE.some((r) => String(p).startsWith(r));
 /** Exclusive upper bound for a prefix range scan on the primary key: "a/" → "a0". */
 export const prefixEnd = (p: string) => p.slice(0, -1) + String.fromCharCode(p.charCodeAt(p.length - 1) + 1);

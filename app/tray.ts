@@ -26,7 +26,7 @@ export function trayMenu(chat: TrayChat | null, show: () => void): { tooltip: st
  * icons do; elsewhere it brings the window to the front and a secondary click opens the menu. */
 export function setupTray(chat: () => TrayChat | null) {
   if (!hasWindow) return;
-  const show = () => Window.orderFront();
+  const show = () => Window.get("main")?.focus();
   const onClick = platform.os === "macos" ? undefined : show;
   effect(() => Tray.set({ icon, onClick, ...trayMenu(chat(), show) }));
 }

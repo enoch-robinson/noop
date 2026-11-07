@@ -68,6 +68,7 @@ export type TaskInfo = {
 };
 
 export type Status = {
+  channels_revision?: string;
   tasks: Record<"proposed" | "inbox" | "active" | "blocked" | "failed" | "done", number>;
   active: TaskInfo[];
   recent?: TaskInfo[];

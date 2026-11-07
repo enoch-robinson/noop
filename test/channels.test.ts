@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA, P, writeDoc } from "../src/core";
 import { channelPrompt, channels, createChannel, resolveChannels, updateChannel } from "../src/channels";
-import { localStore } from "../src/brain";
-import { channelsView, slugify } from "../cloud/src/tools";
+import { context, localStore } from "../src/brain";
+import { channelsView, slugify, writeOp } from "../cloud/src/tools";
 
 const reset = () => { rmSync(P("channels"), { recursive: true, force: true }); rmSync(P("tasks"), { recursive: true, force: true }); rmSync(P("decisions"), { recursive: true, force: true }); };
 const store = () => localStore({ acts: {}, status: () => ({}), feed: () => [], root: DATA });
@@ -61,4 +61,24 @@ test("view: a channel lists its tasks and their cards newest first, and is stale
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+test("channel reports are discoverable and traversal references are excluded", () => {
+  reset();
+  createChannel("Mail quality", "Mail bugs and reliability");
+  writeDoc(P("reports", "mail.md"), {}, "Mail review");
+  writeDoc(P("tasks", "done", "T-0900.md"), { id: "T-0900", title: "Mail report", channels: "mail-quality", finished: "2026-11-07T04:00:00Z" }, "Report: reports/mail.md; duplicate reports/mail.md; invalid reports/../config.md");
+  const rows = channelsView(store()).channels[0].items;
+  expect(rows.filter((i) => i.kind === "report").map((i) => i.id)).toEqual(["reports/mail.md"]);
+});
+
+
+test("the brain sees channel goals and can classify a task at creation", () => {
+  reset();
+  createChannel("Mail quality", "Mail synchronization and reliability");
+  const st = store();
+  expect(context(st, { text: "Fix mail synchronization" })).toContain("Mail synchronization and reliability");
+  const op = writeOp("create_task", { title: "Fix mail sync", channels: ["mail-quality"] }, st);
+  expect(typeof op !== "string" && op.tool === "create_task" && op.channels).toEqual(["mail-quality"]);
 });

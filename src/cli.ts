@@ -32,7 +32,7 @@ import { adoptCloudUrl, readHubToml } from "./sync";
 import { judgeAccuracy, level, needsApproval, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
 import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
 import { accountEnv, accountsStatus, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
-import { resolveChannels, updateChannel } from "./channels";
+import { channelPrompt, resolveChannels, updateChannel } from "./channels";
 
 // ------------------------------------------------------------------ routines (scheduled task generators)
 const STATE = P("logs", "routine-state.json");
@@ -197,7 +197,7 @@ async function processTask(path: string, cfg: Cfg, host: string) {
   const chans = [...new Set([...(meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(res.channels)])].join(",") || undefined;
   for (const f of (res.followups ?? []).slice(0, depth > maxDepth ? 0 : 8)) {
     const id = newTask(f.title, f.body ?? "", { agent: f.agent ?? agent, priority: f.priority ?? meta.priority, repo: f.repo, requires: f.requires, host: f.host,
-      source: `followup:${meta.id}`, extra: { depth: String(depth), ...((f as any).difficulty === "hard" ? { difficulty: "hard" } : {}), ...(ownerWork ? { origin: "owner" } : {}), ...(delegated ? { parent: meta.id } : {}), ...(chans ? { channels: chans } : {}) } });
+      source: `followup:${meta.id}`, extra: { depth: String(depth), ...((f as any).difficulty === "hard" ? { difficulty: "hard" } : {}), ...(ownerWork ? { origin: "owner" } : {}), ...(delegated ? { parent: meta.id } : {}), ...(chans ? { channels: resolveChannels(chans.split(",")).join(",") } : {}) } });
     children.push(id);
     journal(host, `  ↳ ${id} → ${f.agent ?? agent}: ${f.title}`);
   }
@@ -701,12 +701,15 @@ async function planNow(cfg: Cfg, host: string) {
   const todo = list(P("tasks", "inbox"), /^T-.*\.md$/).map((p) => ({ p, ...readDoc(p) })).filter((t) => !t.meta.planned).slice(0, 12);
   if (!todo.length) return;
   const hosts = onlineHosts(cfg).map((h) => `- ${h.host}: ${h.caps.join(",")}`).join("\n");
-  const r = await ask(`You place tasks for an AI agent fleet running on several machines.
+  const r = await quickAsk(`You place tasks for an AI agent fleet running on several machines.
 For each task decide:
+- channels: zero to three slugs from the channel goals below, or {"name":"...","goal":"..."} for a new work topic.
 - requires: host capabilities it truly needs, comma-separated, from the hosts' caps below (e.g. "os:macos" for iOS/macOS builds,
   simulators or screenshots; "os:windows"; "" when any host will do). Only require what the work cannot be done without.
 - cli: one of ${CLIS.map((a) => `"${a.name}"${a.plannerHint ? ` ${a.plannerHint}` : ""}`).join("; ")}.
 - difficulty: "hard" or "normal".
+
+${channelPrompt()}
 
 Online hosts:
 ${hosts || "(unknown)"}
@@ -714,7 +717,7 @@ ${hosts || "(unknown)"}
 Tasks:
 ${todo.map((t) => `- ${t.meta.id} [agent ${t.meta.agent}${t.meta.requires ? `, already requires ${t.meta.requires}` : ""}]: ${t.meta.title} — ${t.body.slice(0, 500).replace(/\s+/g, " ")}`).join("\n")}
 
-Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": "claude", "difficulty": "normal"}, ...}`,
+Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": "claude", "difficulty": "normal", "channels": []}, ...}`,
     cfg, P("logs", "runs", `plan-${Date.now()}.log`));
   if (!r || typeof r !== "object") return; // planner unavailable: tasks run unplanned after plan_wait_minutes
   await locked(async () => {
@@ -724,10 +727,11 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
       if (!v || !existsSync(t.p)) continue;
       const req = [...new Set([...(t.meta.requires ?? "").split(","), ...String(v.requires ?? "").split(",")].map((x) => x.trim()).filter(Boolean))].join(",");
       const pinned = t.meta.cli && t.meta.cli !== "auto";
+      const channelSlugs = [...new Set([...(t.meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(v.channels)])].join(",");
       const planned = byName(String(v.cli ?? ""))?.name;
       // planner named an unregistered CLI: still stored as claude; the journal below logs the raw name
       if (!pinned && v.cli && !planned) journal(host, `⚠️ ${t.meta.id}: planner named unknown cli "${v.cli}", using claude`);
-      writeDoc(t.p, { ...t.meta, requires: req, ...(pinned ? {} : { cli: planned ?? "claude" }),
+      writeDoc(t.p, { ...readDoc(t.p).meta, channels: channelSlugs, requires: req, ...(pinned ? {} : { cli: planned ?? "claude" }),
         ...(v.difficulty === "hard" ? { difficulty: "hard" } : {}), planned: now() }, t.body);
       journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${pinned ? t.meta.cli : v.cli}`);
     }
@@ -820,7 +824,7 @@ async function daemon(cfg: Cfg) {
   // A new task from the owner's chat (created by the chat brain, or by create_task over MCP). It carries the channel's
   // recent conversation and the task it continues, so terse follow-ups ("不行，…", "这个细节记下来") keep their meaning.
   let chatNow: { text: string; chat: string[]; reply?: string; thread?: boolean } | null = null; // the owner message the brain is handling
-  const createOwnerTask = (op: { title: string; details?: string; repo?: string; agent?: string; follows?: string }) => locked(async () => {
+  const createOwnerTask = (op: { title: string; details?: string; repo?: string; agent?: string; follows?: string; channels?: unknown[] }) => locked(async () => {
     await _pull();
     const m = chatNow;
     const prev = op.follows ?? (m?.reply && !["inbox", "active", "waiting"].some((d) => existsSync(P("tasks", d, `${m.reply}.md`))) ? m.reply : undefined);
@@ -831,8 +835,9 @@ async function daemon(cfg: Cfg) {
         `\n## The channel just before this message\nThe owner writes tersely: words like "this", "不行", "这个细节", "以后都这样" refer to what was just said here.\n\n${m.chat.map((l) => `- ${l}`).join("\n")}\n`
       : "";
     const cont = prevFile && prev ? `\nThis continues ${prev} (${prevFile.split("/").slice(-2, -1)[0]}): read tasks/${prevFile.split("/").slice(-2).join("/")} for what was done and how. If the owner is correcting that result, fix it; if they say to remember something ("记录下来", "以后都这样"), write it as a durable rule/memory for the agent and kind of work it concerns, not just in this task.\n` : "";
+    const assignedChannels = resolveChannels(op.channels).join(",");
     const id = newTask(op.title.slice(0, 80), `${asked}${op.details ? `\n## What the chat understood\n${op.details}\n` : ""}${op.repo ? `\nRepo: ${op.repo}\n` : ""}${context}${cont}\nHandle it like a capable chief of staff (see your profile: "Owner requests").`,
-      { agent: op.agent ?? "lead", source: m ? "owner@chat" : "owner@mcp", priority: "high", extra: { origin: "owner", ...(op.repo ? { repo: op.repo } : {}), ...(prevFile && prev ? { follows: prev } : {}) } });
+      { agent: op.agent ?? "lead", source: m ? "owner@chat" : "owner@mcp", priority: "high", extra: { origin: "owner", ...(assignedChannels ? { channels: assignedChannels } : {}), ...(op.repo ? { repo: op.repo } : {}), ...(prevFile && prev ? { follows: prev } : {}) } });
     journal(host, `💬 ${id} from owner ${m ? "chat" : "MCP"}${prevFile ? ` (follows ${prev})` : ""}: ${op.title.slice(0, 80)}`);
     await _commitPush(`[${host}] chat ${id}`);
     // plan it now and wake the loop, so an idle machine starts it within seconds instead of after the next tick or two

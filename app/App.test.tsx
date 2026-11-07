@@ -63,7 +63,7 @@ function auth(log: Auth, opts: { start?: number; code?: string } = {}) {
     [`POST ${URL}/api/auth/verify`]: (r: { body?: string | null }) => {
       const b = JSON.parse(r.body!);
       log.verifies.push(b);
-      return b.code === (opts.code ?? "123456") ? { body: { session: "sess" } } : { status: 401, body: { error: "bad code" } };
+      return b.code === (opts.code ?? "AB12CD34") ? { body: { session: "sess" } } : { status: 401, body: { error: "bad code" } };
     },
     [`POST ${URL}/api/auth/logout`]: () => {
       log.logouts++;
@@ -74,7 +74,7 @@ function auth(log: Auth, opts: { start?: number; code?: string } = {}) {
 const newLog = (): Auth => ({ starts: [], verifies: [], logouts: 0 });
 
 describe("login", () => {
-  test("email, then the 6-digit code logs in and keeps the session", async () => {
+  test("email and authenticator codes log in and keep the session", async () => {
     const log = newLog();
     const app = await open("./App.tsx", { network: { ...hub([]), ...auth(log) } });
     await app.waitFor("Sign in to Noop");
@@ -85,9 +85,10 @@ describe("login", () => {
     await app.waitFor("id:code");
     expect(log.starts).toEqual([{ email: "ceo@example.com" }]);
     expect(app.shows("text:/Resend \\(\\d+s\\)/")).toBe(true);
-    await app.type("id:code", "123456"); // auto-submits on the 6th digit
+    await app.type("id:totp", "654321");
+    await app.type("id:code", "AB12CD34"); // submits only with both factors
     await app.waitFor("id:composer");
-    expect(log.verifies).toEqual([{ email: "ceo@example.com", code: "123456" }]);
+    expect(log.verifies).toEqual([{ email: "ceo@example.com", code: "AB12CD34", totp: "654321" }]);
     expect(app.storage()["hub.token"]).toBe("sess");
     expect(app.storage()["hub.url"]).toBe(URL);
     expect(app.storage()["hub.email"]).toBe("ceo@example.com");
@@ -105,7 +106,8 @@ describe("login", () => {
     expect(app.value("id:email")).toBe("ceo@example.com");
     await app.submit("id:email");
     await app.waitFor("id:code");
-    await app.paste("id:code", { text: "123 456" });
+    await app.type("id:totp", "654321");
+    await app.paste("id:code", { text: "AB12 CD34" });
     await app.waitFor("id:composer");
   });
 
@@ -114,9 +116,15 @@ describe("login", () => {
     const app = await open("./App.tsx", { host: { handlers: { page: { origin: URL } } }, network: { ...hub([]), ...auth(log) } });
     await app.type("id:email", "ceo@example.com");
     await app.press("id:send-code");
-    await app.type("id:code", "000000");
-    await app.waitFor("text:/code is wrong/");
-    expect(app.value("id:code")).toBe("");
+    await app.type("id:totp", "654321");
+    await app.type("id:code", "00000000");
+    await app.waitFor("bad code");
+    expect(app.value("id:code")).toBe("00000000");
+    await app.clear("id:code");
+    await app.type("id:code", "AB12CD34");
+    expect(app.value("id:totp")).toBe("");
+    await app.type("id:totp", "654321");
+    await app.waitFor("id:composer");
 
     const limited = await open("./App.tsx", { host: { handlers: { page: { origin: URL } } }, network: auth(newLog(), { start: 429 }) });
     await limited.type("id:email", "ceo@example.com");
@@ -312,7 +320,7 @@ describe("channel", () => {
   test("shows the timeline, cards and sidebar", async () => {
     const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: 1200, height: 800, platform: "macos" });
     await app.waitFor("要不要升级依赖？建议：B");
-    expect(app.shows("Today")).toBe(true);
+    expect(app.shows(new Date(events[0].ts).toDateString() === new Date().toDateString() ? "Today" : "Yesterday")).toBe(true);
     expect(app.shows("Decide")).toBe(true);
     expect(app.shows("id:opt-D-0001-B")).toBe(true);
     expect(app.shows("All")).toBe(true);
@@ -575,14 +583,13 @@ describe("channel", () => {
       },
     });
     await app.waitFor("id:side-channel-omamail");
-    await app.waitFor("id:side-channel-unread-omamail");
     await app.waitFor("Quiet 7d");
     await app.press("id:side-channel-omamail");
     await app.waitFor("omamail 的 PR 与 issue");
     await app.waitFor("omamail #460 审查");
     await app.waitFor("合并 omamail #460 吗？");
-    await app.waitUntil(() => !app.shows("id:side-channel-unread-omamail"));
     await app.press("id:channel-edit-goal");
+    await app.waitFor("id:channel-goal-input");
     await app.type("id:channel-goal-input", "，以及发布");
     await app.press("id:channel-save-goal");
     await app.waitFor("omamail 的 PR 与 issue，以及发布");
@@ -1080,6 +1087,27 @@ describe("notifications", () => {
     await app.waitUntil(() => app.host.calls().some((c) => c.name === "clearNotifications" && (c.data as { ref: string }).ref === "D-0001"));
   });
 
+  test("mark a message unread, the channel's unread count, and mark all as read", async () => {
+    const app = await open("./App.tsx", {
+      storage: { ...STORAGE, "hub.lastSeen": events[0].ts, "hub.notifyAsked": "1" },
+      network: hub([]),
+      width: 1200, height: 800, platform: "macos",
+    });
+    await app.waitFor("New messages");
+    await app.waitFor("id:toggle-read-e6");
+    await app.waitUntil(() => app.count("id:unread-dot-e6") === 0);
+    await app.press("id:toggle-read-e6");
+    await app.waitUntil(() => app.count("id:unread-dot-e6") > 0 && app.count("id:channel-unread") > 0);
+    await app.press("id:toggle-read-e6");
+    await app.waitUntil(() => app.count("id:unread-dot-e6") === 0);
+    await app.press("id:toggle-read-e6");
+    await app.waitUntil(() => app.count("id:channel-unread") > 0);
+    await app.rightClick("id:channel-unread");
+    await app.press("id:read-all");
+    await app.waitUntil(() => app.count("id:channel-unread") === 0 && app.count("id:unread-dot-e6") === 0);
+    expect(app.storage()["hub.markedUnread"]).toBe("[]");
+  });
+
   test("the unread divider skips an event the channel hides", async () => {
     const app = await open("./App.tsx", {
       storage: { ...STORAGE, "hub.lastSeen": events[3].ts, "hub.notifyAsked": "1" },
@@ -1530,4 +1558,31 @@ describe("commands", () => {
     await app.waitUntil(() => puts.length === 3);
     expect(puts[2]).toEqual({ commands: [{ name: "今日", text: "把今天各项目的进展整理成日报发给我" }] });
   });
+});
+
+
+test("channels share per-message read state with main chat, and Menu can mark all as read", async () => {
+  const older = { id: "shared-old", ts: ts(-300), from: "agent", kind: "notice", text: "Shared channel result", ref: "T-0700" };
+  const later = Array.from({ length: 240 }, (_, i) => ({ id: `unread-${i}`, ts: ts(-290 + i), from: "agent", kind: "notice", text: `Other result ${i}` }));
+  const c = { slug: "omamail", name: "Omamail", goal: "Mail quality", status: "active", created: ts(-900), last_activity: older.ts, stale: false, count: 1,
+    items: [{ id: "T-0700", kind: "task", title: "Review mail", state: "done", updated: older.ts }] };
+  const app = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "linux", network: {
+    ...hub([], [older, ...later]),
+    [`GET ${URL}/api/channels`]: { body: { channels: [c, { ...c, slug: "mail-perf", name: "Mail performance" }] } },
+    [`GET ${URL}/api/tasks/get?*`]: { body: { id: "T-0700", title: "Review mail", agent: "lead", state: "done", request: "Review mail", runs: [], steps: [], events: [older] } },
+  } });
+  await app.waitFor("id:side-channel-unread-omamail");
+  await app.waitFor("id:side-channel-unread-mail-perf");
+  await app.press("id:side-channel-omamail");
+  await app.press("id:channel-item-T-0700");
+  await app.waitUntil(() => {
+    const raw = app.storage()[`hub.read:${URL}`];
+    return !!raw && JSON.parse(raw).ids.includes("shared-old");
+  });
+  expect(app.shows("id:side-channel-unread-omamail")).toBe(false);
+  expect(app.shows("id:side-channel-unread-mail-perf")).toBe(false);
+  await app.press("id:user-menu");
+  await app.press("id:mark-all-read");
+  await app.waitUntil(() => { const raw = app.storage()[`hub.read:${URL}`]; return !!raw && !!JSON.parse(raw).through; });
+  expect(app.shows("id:menu-unread-count")).toBe(false);
 });
