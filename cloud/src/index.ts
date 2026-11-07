@@ -660,7 +660,6 @@ export class Hub extends DurableObject<Env> {
     // the single-card page: no session → the SPA's login flow (same ?ref= target pushes already use)
     if (p.startsWith("/card/") && m === "GET") return this.cardPage(req, p, url);
     const who = await this.who(req, url);
-    const who = await this.who(req, url);
     // a connector's OAuth token is for /mcp only: never the owner API (settings, machine key via /api/host/join, …)
     if (who && who !== "machine" && who.scope === "mcp") return json({ error: "forbidden" }, 403);
     // ntfy banner buttons hold the answer-only token (HUB_ANSWER_TOKEN): the bypass below admits it to exactly ONE
