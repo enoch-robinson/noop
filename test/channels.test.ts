@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DATA, P, writeDoc } from "../src/core";
 import { channelPrompt, channels, createChannel, resolveChannels, updateChannel } from "../src/channels";
 import { localStore } from "../src/brain";
@@ -37,18 +39,26 @@ test("owner edits: goal and archive; unknown slugs are refused", () => {
 });
 
 test("view: a channel lists its tasks and their cards newest first, and is stale after 7 quiet days", () => {
-  reset();
-  createChannel("Omamail", "omamail");
-  createChannel("Omasend", "omasend");
-  writeDoc(P("tasks", "done", "T-0001.md"), { id: "T-0001", title: "review omamail #1", channels: "omamail,gone", created: "2026-11-07T01:00:00Z", finished: "2026-11-07T02:00:00Z" }, "x");
-  writeDoc(P("tasks", "blocked", "T-0002.md"), { id: "T-0002", title: "merge omamail #2?", channels: "omamail", created: "2026-11-07T03:00:00Z" }, "x");
-  writeDoc(P("decisions", "open", "D-0001.md"), { id: "D-0001", task: "T-0002", question: "合并 #2 吗？", created: "2026-11-07T04:00:00Z" }, "x");
-  writeDoc(P("tasks", "done", "T-0003.md"), { id: "T-0003", title: "unrelated", created: "2026-11-07T05:00:00Z" }, "x");
-  const v = channelsView(store(), Date.parse("2026-11-08T00:00:00Z"));
-  const om = v.channels.find((c) => c.slug === "omamail")!;
-  expect(om.items.map((i) => i.id)).toEqual(["D-0001", "T-0002", "T-0001"]);
-  expect(om.stale).toBe(false);
-  expect(om.count).toBe(3);
-  expect(v.channels.find((c) => c.slug === "omasend")!.stale).toBe(false); // just created
-  expect(channelsView(store(), Date.parse("2026-11-20T00:00:00Z")).channels.every((c) => c.stale)).toBe(true);
+  // own data root: the shared dir feeds other files' searches (brain.test counts 合并 decisions exactly),
+  // and bun test interleaves files, so anything written here is visible to them mid-run
+  const root = mkdtempSync(join(tmpdir(), "noop-channels-"));
+  try {
+    const st = localStore({ acts: {}, status: () => ({}), feed: () => [], root });
+    const now = new Date().toISOString();
+    writeDoc(join(root, "channels", "omamail.md"), { name: "Omamail", goal: "omamail", status: "active", created: now }, "");
+    writeDoc(join(root, "channels", "omasend.md"), { name: "Omasend", goal: "omasend", status: "active", created: now }, "");
+    writeDoc(join(root, "tasks", "done", "T-0001.md"), { id: "T-0001", title: "review omamail #1", channels: "omamail,gone", created: "2026-11-07T01:00:00Z", finished: "2026-11-07T02:00:00Z" }, "x");
+    writeDoc(join(root, "tasks", "blocked", "T-0002.md"), { id: "T-0002", title: "merge omamail #2?", channels: "omamail", created: "2026-11-07T03:00:00Z" }, "x");
+    writeDoc(join(root, "decisions", "open", "D-0001.md"), { id: "D-0001", task: "T-0002", question: "合并 #2 吗？", created: "2026-11-07T04:00:00Z" }, "x");
+    writeDoc(join(root, "tasks", "done", "T-0003.md"), { id: "T-0003", title: "unrelated", created: "2026-11-07T05:00:00Z" }, "x");
+    const v = channelsView(st, Date.parse("2026-11-08T00:00:00Z"));
+    const om = v.channels.find((c) => c.slug === "omamail")!;
+    expect(om.items.map((i) => i.id)).toEqual(["D-0001", "T-0002", "T-0001"]);
+    expect(om.stale).toBe(false);
+    expect(om.count).toBe(3);
+    expect(v.channels.find((c) => c.slug === "omasend")!.stale).toBe(false); // just created
+    expect(channelsView(st, Date.parse("2026-11-20T00:00:00Z")).channels.every((c) => c.stale)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
