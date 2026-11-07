@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { due } from "../src/cli";
 import { matches, signature, type Cfg } from "../src/core";
 import { parseResult, runAgent } from "../src/runner";
@@ -272,6 +273,159 @@ test("codex can write to project checkouts and scratch, not only its cwd", async
   const cmd = cliCommand("codex", {} as any);
   expect(cmd.at(-1)).toBe("-");
   expect(cmd).toContain("--add-dir");
+});
+
+test("opencode adapter: unlocked headless command, gate translation, and stream parsing", async () => {
+  const { cliCommand } = await import("../src/runner");
+  const { byName, gateDeny, gateAgentMd } = await import("../src/clis");
+  const unlocked = cliCommand("opencode", {} as any, true); // decision-unlocked: no gate agent
+  expect(unlocked).toEqual(["opencode", "run", "--format", "json", "--auto"]);
+  const modeled = cliCommand("opencode", { clis: { opencode: { model: "x/y" } } } as any, true);
+  expect(modeled).toContain("--model");
+  expect(gateDeny("Bash(gh pr merge:*)")).toBe("gh pr merge*");
+  expect(gateDeny("Bash(git push --force:*)")).toBe("git push --force*");
+  expect(gateDeny("Bash(gh api repos/:*)")).toBe("gh api repos/*"); // no space: a prefix, not a word boundary
+  const md = gateAgentMd(["Bash(gh pr merge:*)"]);
+  expect(md).toContain('resource: "gh pr merge*", effect: deny');
+  expect(md).toContain("mode: all");
+
+  const ev = { step: undefined as string | undefined, steps: 0, assistantText: "", resultText: undefined as string | undefined, inFlight: new Map<string, string>() };
+  const a = byName("opencode")!;
+  const tool = { type: "tool_use", part: { type: "tool", id: "c1", tool: "shell", state: { input: { command: "echo noop-probe-123" } } } };
+  a.parseEvent!(tool, ev);
+  a.parseEvent!(tool, ev); // the same tool id again is an update, not a second step
+  a.parseEvent!({ type: "text", part: { type: "text", text: "DONE" } }, ev);
+  expect(ev.steps).toBe(1);
+  expect(ev.step).toBe("shell · echo noop-probe-123");
+  expect(ev.assistantText).toBe("DONE");
+});
+
+test("pi/omp adapters: shared event parsing and omp gate overlay", async () => {
+  const { cliCommand } = await import("../src/runner");
+  const { byName, ompGateOverlayMd } = await import("../src/clis");
+  const ev = { step: undefined as string | undefined, steps: 0, assistantText: "", resultText: undefined as string | undefined, inFlight: new Map<string, string>() };
+  const pi = byName("pi")!;
+  pi.parseEvent!({ type: "message_update", assistantMessageEvent: { type: "toolcall_end", toolCall: { type: "toolCall", id: "c1", name: "bash", arguments: { command: "echo noop-pi-probe ." } } } }, ev);
+  pi.parseEvent!({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "DONE" }] } }, ev);
+  expect(ev.steps).toBe(1);
+  expect(ev.step).toBe("bash · echo noop-pi-probe .");
+  expect(ev.assistantText).toBe("DONE");
+
+  const unlocked = cliCommand("omp", {} as any, true); // decision-unlocked: no gate overlay
+  expect(unlocked).toEqual(["omp", "-p", "--mode", "json", "--approval-mode", "yolo"]);
+  const yml = ompGateOverlayMd(["Bash(gh pr merge:*)"]);
+  expect(yml).toContain('match: "gh pr merge*"');
+  expect(yml).toContain("approval: deny");
+  expect(yml).toContain("eval: deny");
+});
+
+test("claude stream parsing survives the move into the adapter", async () => {
+  const { byName } = await import("../src/clis");
+  const a = byName("claude")!;
+  const ev = { step: undefined as string | undefined, steps: 0, assistantText: "", resultText: undefined as string | undefined, inFlight: new Map<string, string>() };
+  a.parseEvent!({ type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "gh pr checks 1" } }, { type: "text", text: "hello" }] } }, ev);
+  a.parseEvent!({ type: "assistant", parent_tool_use_id: "x", message: { content: [{ type: "text", text: " from subagent" }] } }, ev);
+  a.parseEvent!({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1" }] } }, ev);
+  a.parseEvent!({ type: "result", result: "final report" }, ev);
+  expect(ev.steps).toBe(1);
+  expect(ev.step).toBe("Bash · gh pr checks 1");
+  expect(ev.assistantText).toBe("hello"); // subagent text is not the report
+  expect(ev.resultText).toBe("final report");
+  expect(ev.inFlight.size).toBe(0);
+});
+
+test("medic and doctor ride the registry: every adapter serves a plain-text medic call, opencode needs v2", async () => {
+  const { CLIS, byName } = await import("../src/clis");
+  const { versionMajor } = await import("../src/visual");
+  for (const a of CLIS) {
+    const cmd = a.medicCommand?.() ?? [];
+    expect(cmd[0]).toBe(a.name); // the real binary; registry order decides which one the medic picks
+    expect(cmd.join(" ")).not.toContain("--no-tools"); // a medic that cannot run tools cannot fix anything
+  }
+  expect(byName("claude")!.medicCommand!().join(" ")).toContain("git push --force"); // medic keeps its guardrails
+  expect(versionMajor("2.2.5")).toBe(2);
+  expect(versionMajor("v1.3.0")).toBe(1);
+  expect(versionMajor("")).toBeNaN();
+});
+
+test("rules delivery: verified CLIs only, and noop never overwrites owner rules", async () => {
+  const { CLIS, byName } = await import("../src/clis");
+  const { deliverRules } = await import("../src/rules");
+  expect(CLIS.filter((a) => a.rules).map((a) => a.name)).toEqual(["opencode", "pi", "omp"]); // claude/codex stay hand-wired
+  expect(byName("pi")!.rules!.file()).toMatch(/[/\\]\.pi[/\\]agent[/\\]AGENTS\.md$/);
+  expect(byName("omp")!.rules!.file()).toMatch(/[/\\]\.omp[/\\]agent[/\\]AGENTS\.md$/);
+
+  const dir = join(tmpdir(), `noop-rules-${Date.now()}`);
+  const f = join(dir, "AGENTS.md");
+  try {
+    expect(deliverRules(f, "gen v1")).toBe(true); // missing → write
+    expect(deliverRules(f, "gen v1")).toBe(false); // unchanged → skip
+    expect(deliverRules(f, "gen v2")).toBe(false); // not noop-generated → never overwrite
+    const mine = join(dir, "mine.md");
+    writeFileSync(mine, "<!-- Generated by Noop -->\nold gen");
+    expect(deliverRules(mine, "gen v3")).toBe(true); // noop-owned → refresh
+    expect(readFileSync(mine, "utf8")).toBe("gen v3");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("pi/omp session reader: owner turns from the shared JSONL family", async () => {
+  const { readPiStyle } = await import("../src/sessions");
+  const dir = join(tmpdir(), `noop-sess-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  const line = (o: any) => JSON.stringify(o);
+  try {
+    const f = join(dir, "s.jsonl");
+    writeFileSync(f, [
+      line({ type: "session", version: 3, id: "x", cwd: "/workspace/proj-a" }),
+      line({ type: "model_change", id: "m" }),
+      line({ type: "message", timestamp: "2026-11-07T01:00:00Z", message: { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "I will fix the flaky test." }] } }),
+      line({ type: "message", timestamp: "2026-11-07T01:01:00Z", message: { role: "user", content: [{ type: "text", text: "不对，revert 这个改动" }] } }),
+    ].join("\n"));
+    const turns = readPiStyle(f, "pi");
+    expect(turns).toHaveLength(1); // thinking/toolCall entries and assistant turns are not owner words
+    expect(turns[0]).toMatchObject({ project: "proj-a", tool: "pi", text: "不对，revert 这个改动" });
+    expect(turns[0].prev).toContain("flaky test");
+
+    const fleet = join(dir, "fleet.jsonl");
+    writeFileSync(fleet, [
+      line({ type: "session", version: 3, id: "y", cwd: "/tmp" }),
+      line({ type: "message", timestamp: "2026-11-07T02:00:00Z", message: { role: "user", content: [{ type: "text", text: "You are **lead**, a permanent member of the fleet. Do the task." }] } }),
+    ].join("\n"));
+    expect(readPiStyle(fleet, "omp")).toEqual([]); // a fleet agent run is not the owner speaking
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("every adapter builds a headless command and maps the gate list; the scheduler stays registry-driven", async () => {
+  const { cliCommand } = await import("../src/runner");
+  const { CLIS } = await import("../src/clis");
+  const { hostCaps, allowedClis, chooseCli } = await import("../src/core");
+
+  // claude: gated runs carry the deny list, decision-unlocked runs drop it
+  const gated = cliCommand("claude", {} as any);
+  expect(gated).toContain("--disallowedTools");
+  expect(gated.join(" ")).toContain("Bash(gh pr merge:*)");
+  expect(cliCommand("claude", {} as any, true)).not.toContain("--disallowedTools");
+
+  // pi: same shape as omp, model override rides along
+  expect(cliCommand("pi", {} as any, true)).toEqual(["pi", "-p", "--mode", "json"]);
+  expect(cliCommand("pi", { clis: { pi: { model: "x/y" } } } as any, true)).toContain("--model");
+
+  // scheduler facts come from the registry, not hardcoded lists
+  expect(allowedClis({}, {} as any)).toEqual(CLIS.map((a) => a.name));
+  expect(allowedClis({ cli: "omp" }, {} as any)).toEqual(["omp"]);
+  expect(chooseCli({}, {} as any)).toBe(CLIS.map((a) => a.name).find((c) => Bun.which(c)) ?? null); // first installed, registry order
+  const caps = hostCaps({} as any);
+  for (const a of CLIS) expect(caps.includes(`cli:${a.name}`)).toBe(!!Bun.which(a.name));
+  for (const a of CLIS) expect(a.accounts?.label).toBeTruthy(); // all five are wired into account rotation
+});
+
+test("runAgent falls back to plain text when the command emits no JSON events", async () => {
+  const lines = 'working...\n```json\n{"status":"done","summary":"plain"}\n```';
+  const cfg = { clis: { fake: { command: ["sh", "-c", 'printf "%s\\n" "$1"', "plain", lines] } } } as unknown as Cfg;
+  const log = `${tmpdir()}/noop-run-plain-${process.pid}.log`;
+  const out = await runAgent("fake", "", tmpdir(), cfg, log);
+  rmSync(log, { force: true });
+  expect(parseResult(out)).toMatchObject({ status: "done", summary: "plain" });
 });
 
 test("checkWaits: a waiting task wakes early once its wait_check exit code changes", async () => {

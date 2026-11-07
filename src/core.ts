@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFile
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import * as sync from "./sync";
+import { CLIS } from "./clis";
 
 /** Framework code (this repo, self-updating). */
 export const CODE = resolve(import.meta.dir, "..");
@@ -162,7 +163,7 @@ export type TaskOpts = {
 /** Capabilities of this machine: os:<linux|macos|windows>, host:<name>, plus config [host].caps (e.g. gpu, docker, home). */
 export function hostCaps(cfg: Cfg): string[] {
   const os = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
-  const clis = ["claude", "codex", "gh", "cargo", "bun", "node"].filter((c) => Bun.which(c)).map((c) => `cli:${c}`);
+  const clis = [...CLIS.map((a) => a.name), "gh", "cargo", "bun", "node"].filter((c) => Bun.which(c)).map((c) => `cli:${c}`);
   return [`os:${os}`, `host:${hostName(cfg)}`, `arch:${process.arch}`, ...clis, ...(cfg.host?.caps ?? [])];
 }
 
@@ -207,12 +208,12 @@ export function newTask(title: string, body = "", o: TaskOpts = {}): string {
 export const which = (bin: string) => Bun.which(bin) !== null;
 
 /** Which CLI runs a task: the owner's per-agent config wins, else what the planner (an AI call, see planInbox) chose.
- *  Unplanned tasks may use either, Claude first. */
+ *  Unplanned tasks may use any registered CLI, Claude first. */
 export function allowedClis(meta: Record<string, string>, cfg: Cfg): string[] {
   if (meta.cli && meta.cli !== "auto") return [meta.cli];
   const per = cfg.clis?.agents?.[meta.agent || "lead"] as string[] | undefined;
   if (per) return per;
-  return ["claude", "codex"];
+  return CLIS.map((a) => a.name);
 }
 
 export function chooseCli(meta: Record<string, string>, cfg: Cfg): string | null {

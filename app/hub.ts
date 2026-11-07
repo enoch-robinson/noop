@@ -237,9 +237,12 @@ export type SettingsView = {
 
 const CLI_LABELS = (): Record<string, string> => ({
   claude: L("Claude only", "仅 Claude"),
+  codex: L("Codex only", "仅 Codex"),
+  opencode: L("opencode only", "仅 opencode"),
+  pi: L("pi only", "仅 pi"),
+  omp: L("omp only", "仅 omp"),
   "codex,claude": "Codex → Claude",
   "claude,codex": "Claude → Codex",
-  codex: L("Codex only", "仅 Codex"),
 });
 export const cliKey = (clis: string[]) => clis.join(",");
 export const cliLabel = (clis: string[]) => CLI_LABELS()[cliKey(clis)] ?? clis.join(" → ");

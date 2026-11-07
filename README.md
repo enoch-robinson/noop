@@ -6,7 +6,7 @@ Your own AI team, so your day can be a no-op.
 
 <img width="2000" height="1390" alt="The Noop app: the team channel with agent updates, beside lists of tasks" src="website/public/screenshot.png" />
 
-Noop runs a small team of Claude Code and Codex agents on your own computers. They do your daily work, decide what they can based on how you've decided before, and only ask you when something really needs you — with a short list of options you answer in one tap.
+Noop runs a small team of coding agents — Claude Code, Codex, opencode, pi, omp — on your own computers. They do your daily work, decide what they can based on how you've decided before, and only ask you when something really needs you — with a short list of options you answer in one tap.
 
 - **Works for you, not with you** — give it a goal in one sentence; it breaks the work down, runs it in parallel and comes back with results.
 - **Learns how you decide** — starts cautious, asks more early on, and takes over more as it proves it decides like you.

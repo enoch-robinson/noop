@@ -17,6 +17,7 @@ import { basename, join } from "node:path";
 import type { ServerWebSocket } from "bun";
 import { accountsInfo } from "./accounts";
 import { type Cfg, DATA, P, allowedClis, hostName, list, loadConfig, onlineHosts, readDoc, UPDATE_REQUEST } from "./core";
+import { CLIS } from "./clis";
 import { ownerAttachments, sniffImage, uploadId, uploadProblem } from "../cloud/src/uploads";
 import { readable, validPath } from "../cloud/src/files";
 import { parseTaskBody, taskHistory, taskInfo } from "../cloud/src/tools";
@@ -252,6 +253,8 @@ const routineDesc = (r: any) =>
 export function settingsView() {
   const cfg = loadConfig();
   const agents = readdirSync(P("agents"), { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+  // presets for per-agent allowedClis: pin one installed CLI, or the full registry order (= the unset default, claude first)
+  const installed = CLIS.map((a) => a.name).filter((c) => Bun.which(c));
   return {
     current: existsSync(P("settings.json")) ? JSON.parse(readFileSync(P("settings.json"), "utf8")) : {},
     effective: {
@@ -261,7 +264,7 @@ export function settingsView() {
       max_parallel: cfg.host?.max_parallel ?? null,
       media_days: mediaDays(cfg),
     },
-    options: { clis: [["claude"], ["codex", "claude"], ["claude", "codex"], ["codex"]], autonomy: ["onboarding", "assisted", "autonomous"] },
+    options: { clis: [...installed.map((c) => [c]), CLIS.map((a) => a.name)], autonomy: ["onboarding", "assisted", "autonomous"] },
   };
 }
 

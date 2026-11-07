@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { arch, homedir, platform, release } from "node:os";
 import { join } from "node:path";
 import { type Cfg, CODE, DATA, hostName, HOME_DIR } from "./core";
+import { CLIS } from "./clis";
 
 const STATE = join(HOME_DIR, "medic.json");
 const LOGDIR = join(HOME_DIR, "medic");
@@ -25,7 +26,7 @@ async function context(): Promise<string> {
     `OS: ${platform()} ${release()} ${arch()} · host ${hostName({})}`,
     `framework: ${CODE} @ ${await sh(`git -C '${CODE}' log -1 --oneline 2>&1`)} · status:\n${await sh(`git -C '${CODE}' status --short 2>&1 | head -20`)}`,
     `data: ${DATA} · sync ${await (await import("./sync")).syncStatus().catch((e) => String(e))}`,
-    `tools: ${await sh("for b in bun git gh claude codex; do printf '%s=%s ' $b \"$(command -v $b || echo missing)\"; done")}`,
+    `tools: ${await sh(`for b in bun git gh ${CLIS.map((a) => a.name).join(" ")}; do printf '%s=%s ' $b "$(command -v $b || echo missing)"; done`)}`,
     `bun ${await sh("bun --version 2>&1")} · gh auth: ${await sh("gh auth status 2>&1 | head -4")}`,
     `service log tail:\n${svc}`,
   ].join("\n");
@@ -60,12 +61,12 @@ export async function medic(problem: string, cfg: Cfg, opts: { auto?: boolean; k
   mkdirSync(LOGDIR, { recursive: true });
   writeFileSync(STATE, JSON.stringify(state));
 
-  const cli = ["claude", "codex"].find((c) => Bun.which(c));
-  if (!cli) { console.error("medic: neither claude nor codex is installed"); return null; }
+  // registry order = preference order: claude first, then whatever else is installed
+  const adapter = CLIS.find((a) => a.medicCommand && Bun.which(a.name));
+  if (!adapter) { console.error(`medic: no agent CLI is installed (looked for: ${CLIS.map((a) => a.name).join(", ")})`); return null; }
   const prompt = PROMPT(problem, await context(), cfg.medic?.push !== false);
-  const cmd = cli === "claude"
-    ? ["claude", "-p", "--output-format", "text", "--permission-mode", "bypassPermissions", "--disallowedTools", "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(rm -rf /:*)", "Bash(rm -rf ~:*)"]
-    : ["codex", "exec", "--skip-git-repo-check", "--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-"];
+  const cmd = adapter.medicCommand!();
+  const cli = adapter.name;
   console.error(`🩺 medic (${cli}) is looking at: ${problem.split("\n")[0].slice(0, 120)}`);
   const p = Bun.spawn(cmd, { cwd: CODE, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe", env: { ...process.env, HUB_NO_MEDIC: "1" } });
   const timer = setTimeout(() => p.kill(), (cfg.medic?.timeout_minutes ?? 30) * 60_000);

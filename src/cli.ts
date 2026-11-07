@@ -9,6 +9,7 @@ import {
 import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, overrideJudge, recentJudgeIds, routeDecision } from "./decisions";
 import { notify, openDecisionIds, pollReplies } from "./notify";
 import { STALLED, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent } from "./runner";
+import { byName, CLIS } from "./clis";
 import { writeRules } from "./rules";
 import { backoffMinutes, isNoChangeRoutine, tooManyWakes, waitMeta } from "./waits";
 import { allowedParallel, budget, canRunHeavy, ensureDisk, sample } from "./resources";
@@ -120,7 +121,7 @@ async function processTask(path: string, cfg: Cfg, host: string) {
   let cli = acct.cli, out = "", res!: ReturnType<typeof parseResult>;
   for (let hop = 0; ; hop++) { // quota / login trouble: switch account or CLI on this host instead of waiting it out
     cli = acct.cli;
-    const model = cfg.clis?.[cli]?.model ?? (cli === "claude" ? "claude-opus-5-5" : "default");
+    const model = cfg.clis?.[cli]?.model ?? byName(cli)?.defaultModel ?? "default";
     meta.cli_used = cli; meta.model = model; meta.account = acct.name;
     await locked(async () => {
       if (existsSync(path)) writeDoc(path, meta, body); // the app shows which model runs it
@@ -604,7 +605,7 @@ export async function tick(cfg: Cfg, background = false) {
     const s = sample(cfg);
     const max = allowedParallel(s, cfg, running);
     if (running >= max) break;
-    if (!pickAccount(cfg, ["claude", "codex"].filter((c) => Bun.which(c)))) break;
+    if (!pickAccount(cfg, CLIS.map((a) => a.name).filter((c) => Bun.which(c)))) break;
     if ((await githubStarved(cfg)).starved && list(P("tasks", "inbox"), /^T-.*\.md$/).every((p) => GH_HEAVY.has(readDoc(p).meta.agent))) break;
     const t = pickTask(cfg, s.loadRatio, canRunHeavy(s, cfg, running));
     if (!t) break;
@@ -643,7 +644,7 @@ async function planNow(cfg: Cfg, host: string) {
 For each task decide:
 - requires: host capabilities it truly needs, comma-separated, from the hosts' caps below (e.g. "os:macos" for iOS/macOS builds,
   simulators or screenshots; "os:windows"; "" when any host will do). Only require what the work cannot be done without.
-- cli: "claude" for engineering, debugging, design, UI or judgement; "codex" for routine triage, monitoring, reports, first-pass reviews.
+- cli: one of ${CLIS.map((a) => `"${a.name}"${a.plannerHint ? ` ${a.plannerHint}` : ""}`).join("; ")}.
 - difficulty: "hard" or "normal".
 
 Online hosts:
@@ -662,7 +663,10 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
       if (!v || !existsSync(t.p)) continue;
       const req = [...new Set([...(t.meta.requires ?? "").split(","), ...String(v.requires ?? "").split(",")].map((x) => x.trim()).filter(Boolean))].join(",");
       const pinned = t.meta.cli && t.meta.cli !== "auto";
-      writeDoc(t.p, { ...t.meta, requires: req, ...(pinned ? {} : { cli: v.cli === "codex" ? "codex" : "claude" }),
+      const planned = byName(String(v.cli ?? ""))?.name;
+      // planner named an unregistered CLI: still stored as claude; the journal below logs the raw name
+      if (!pinned && v.cli && !planned) journal(host, `⚠️ ${t.meta.id}: planner named unknown cli "${v.cli}", using claude`);
+      writeDoc(t.p, { ...t.meta, requires: req, ...(pinned ? {} : { cli: planned ?? "claude" }),
         ...(v.difficulty === "hard" ? { difficulty: "hard" } : {}), planned: now() }, t.body);
       journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${pinned ? t.meta.cli : v.cli}`);
     }
@@ -910,7 +914,7 @@ const HELP = `Noop — your own AI team
 
   noop daemon                 run forever (tick every host.tick_seconds)
   noop tick                   one cycle: pull → routines → replies → judge → run tasks → push
-  noop add "title" [-b body] [-a agent] [-r os:linux (hard)] [--prefer os:macos (soft)] [-w heavy] [--host name] [--repo ~/work/x] [-p high] [--cli claude|codex]
+  noop add "title" [-b body] [-a agent] [-r os:linux (hard)] [--prefer os:macos (soft)] [-w heavy] [--host name] [--repo ~/work/x] [-p high] [--cli ${CLIS.map((a) => a.name).join("|")}]
   noop decide D-0001 "A"      answer a decision from the terminal
   noop status                 queue / decision / accounts / resources overview
   noop learn [--full] [--dry]  learn the CEO from local Claude/Codex sessions (digest stays local; principles go to memory)

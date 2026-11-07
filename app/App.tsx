@@ -2161,9 +2161,9 @@ const AUTONOMY_DETAIL = (): Record<string, string> => ({
 });
 const cliDetail = (c: string[]) => {
   const name = (x: string) => cliLabel([x]).replace(/^(仅|only)\s*/i, "");
-  return c.length === 1
-    ? L(`Only ${name(c[0]!)}`, `只用 ${name(c[0]!)}`)
-    : L(`${name(c[0]!)} first, then ${name(c[1]!)} on failure or when out of quota`, `先用 ${name(c[0]!)}，失败或额度用尽时换 ${name(c[1]!)}`);
+  if (c.length === 1) return L(`Only ${name(c[0]!)}`, `只用 ${name(c[0]!)}`);
+  const rest = c.slice(1).map(name).join(" → ");
+  return L(`${name(c[0]!)} first, then ${rest} on failure or when out of quota`, `先用 ${name(c[0]!)}，失败或额度用尽时依次换 ${rest}`);
 };
 
 type DropdownOption = { id: string; label: string; detail?: string; testID?: string };

@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { HOME_DIR } from "./core";
+import { CLIS } from "./clis";
 
 const BASE = join(HOME_DIR, "visual");
 type Sess = { name: string; backend: "sway" | "xvfb" | "macos"; env: Record<string, string>; pids: number[]; rec?: number; size: string };
@@ -141,8 +142,11 @@ hub visual stop <name>`);
   }
 }
 
+/** First number of a version string ("2.2.5" → 2, "v1.3.0" → 1); NaN when there is none. */
+export const versionMajor = (v: string) => Number(v.match(/(\d+)\./)?.[1]);
+
 export async function doctor() {
-  const need: [string, string][] = [["git", "core"], ["bun", "core"], ["gh", "GitHub"], ["claude", "agent"], ["codex", "agent"]];
+  const need: [string, string][] = [["git", "core"], ["bun", "core"], ["gh", "GitHub"], ...CLIS.map((a) => [a.name, "agent"] as [string, string])];
   if (process.platform === "linux") need.push(["sway", "visual (GPU headless)"], ["wf-recorder", "visual recording (sway)"], ["grim", "visual screenshot (sway)"],
     ["wtype", "visual input (sway)"], ["Xvfb", "visual fallback"], ["ffmpeg", "visual fallback/recording"], ["xdotool", "visual input (Xvfb)"], ["script", "headless login"]);
   const missing: string[] = [];
@@ -152,6 +156,12 @@ export async function doctor() {
     console.log(`${ok ? "✔" : "✘"} ${b.padEnd(12)} ${why}`);
   }
   console.log(`visual backend: ${backendFor()}`);
+  // noop's opencode integration needs v2 (--agent/--auto on runs, V2 permissions for the gate agent); v1 cannot serve gated tasks
+  if (Bun.which("opencode")) {
+    const r = await $`opencode --version`.quiet().nothrow();
+    const v = (r.stdout.toString() + r.stderr.toString()).trim().split("\n")[0];
+    if (v && !(versionMajor(v) >= 2)) console.log(`⚠ opencode ${v}: noop needs opencode v2+ (--agent/--auto, permissions V2); please upgrade`);
+  }
   if (missing.length && process.platform === "linux" && Bun.which("pacman"))
-    console.log(`\ninstall:  sudo pacman -S --needed ${missing.filter((m) => !["claude", "codex", "bun"].includes(m)).map((m) => m === "Xvfb" ? "xorg-server-xvfb" : m === "script" ? "util-linux" : m === "gh" ? "github-cli" : m).join(" ")}`);
+    console.log(`\ninstall:  sudo pacman -S --needed ${missing.filter((m) => !["bun", ...CLIS.map((a) => a.name)].includes(m)).map((m) => m === "Xvfb" ? "xorg-server-xvfb" : m === "script" ? "util-linux" : m === "gh" ? "github-cli" : m).join(" ")}`);
 }

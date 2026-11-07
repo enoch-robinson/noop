@@ -24,7 +24,8 @@ export const DEFAULT_GATES = [
   "Bash(rm -rf ~:*)",
 ];
 
-export function claudeDisallowed(cfg: Cfg, override = false): string[] {
+/** The hard-gate deny list (CLI-agnostic policy; each adapter translates it, e.g. Claude Code --disallowedTools). */
+export function gateList(cfg: Cfg, override = false): string[] {
   if (override) return [];
   return [...DEFAULT_GATES, ...(cfg.gates?.github_rest === false ? [] : GH_REST_GATES), ...(cfg.gates?.extra ?? [])];
 }

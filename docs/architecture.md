@@ -26,16 +26,17 @@
 | Path | What |
 |---|---|
 | `src/cli.ts` | CLI entry and the daemon loop (`pull → routines → replies → judge → run tasks → push`) |
+| `src/clis.ts` | per-CLI adapters (headless command, event parsing, gate mapping, accounts, rules path) — adding a CLI means adding one adapter, not new branches elsewhere |
 | `src/core.ts` | config, local paths (`HOME_DIR`), tasks, claims, journal, `locked()` |
 | `src/sync.ts` | file sync with the Worker (CAS commit, pull, merge of append-only files) |
-| `src/runner.ts` | prompt building and running Claude Code / Codex |
+| `src/runner.ts` | prompt building and result parsing; runs the task through the adapter the scheduler picked |
 | `src/decisions.ts`, `src/autonomy.ts` | the judge, proposals, graduated autonomy |
 | `src/gates.ts`, `src/github.ts` | hard gates, GitHub quota etiquette |
 | `src/accounts.ts` | multiple AI accounts, quota cooldown, remote login links |
 | `src/resources.ts` | resource governor and disk cleanup |
 | `src/notify.ts`, `src/server.ts`, `src/cloud.ts` | events, local API, Worker bridge and deploy |
 | `src/medic.ts` | AI self-repair for install/update/daemon failures |
-| `src/sessions.ts` | learning the owner from local Claude/Codex history (redacted, never uploaded raw) |
+| `src/sessions.ts` | learning the owner from local agent session history (Claude/Codex/pi/omp; redacted, never uploaded raw) |
 | `src/setup.ts` | init, join, install as a service, self-update with rollback |
 | `cloud/` | the Worker: `index.ts` (routes, auth, feed), `files.ts`, `smtp.ts`, `push.ts` |
 | `app/` | the NSH client; machines download the web package from the latest release (`src/webclient.ts`), and `app/build-web.sh` builds it locally |
@@ -62,6 +63,17 @@ Auth: the machine token (hosts) or an owner session from email login (clients). 
 ## Agents and safety
 
 - The lead agent owns every task and decides how much process it needs; other roles are spawned as parallel sub-agents.
-- Hard gates (`src/gates.ts`) are enforced through Claude Code's `--disallowedTools`, not model judgment: merge, approve, release, publish, force-push, pushing to main, repo/secret admin, GitHub REST loops. Running one requires an owner decision, which unlocks it for that run only.
+- Tasks run through registered CLIs in registry order (claude, codex, opencode, pi, omp); config `[clis.<name>]` overrides the model or the whole command, `[clis.agents]` pins per-agent preferences.
+- Hard gates (`src/gates.ts`) are enforced mechanically, not by model judgment: merge, approve, release, publish, force-push, pushing to main, repo/secret admin, GitHub REST loops. Running one requires an owner decision, which unlocks it for that run only. What a CLI can mechanically enforce differs:
+
+| CLI | headless task run | hard gates | accounts | owner rules |
+|---|---|---|---|---|
+| claude | `claude -p --output-format stream-json` | `--disallowedTools` | rotation, isolated config dirs, remote login | hand-wired import of `~/.noop/rules.md` |
+| codex | `codex exec --sandbox workspace-write` | not enforced (sandbox only; the network gap is a known issue) | rotation, isolated `CODEX_HOME`, device login | hand-wired `~/.codex/AGENTS.md` |
+| opencode | `opencode run --format json --auto` (needs opencode v2) | generated global agent with V2 permission denies (`--agent noop`) | rotation on the default login | auto: `~/.config/opencode/AGENTS.md` |
+| pi | `pi -p --mode json` | not enforced (no command-level approval machinery) | rotation on the default login | auto: `~/.pi/agent/AGENTS.md` |
+| omp | `omp -p --mode json --approval-mode yolo` | per-run `--config` overlay, bash-pattern deny holds under yolo | rotation on the default login | auto: `~/.omp/agent/AGENTS.md` |
+
+- The rules file (`~/.noop/rules.md`) is generated from `policies/` + `memory/` and delivered to every installed CLI with a verified user-level rules file; noop only refreshes files it generated itself (marker line) and never overwrites the owner's own rules.
 - Anything posted outside Noop carries the agent's signature.
-- Failures are retried; tooling problems go to the medic; the owner is told only about failures of work they asked for, in one plain sentence.
+- Failures are retried; tooling problems go to the medic (any installed agent CLI, registry order, with force-push/rm guardrails on claude); the owner is told only about failures of work they asked for, in one plain sentence.

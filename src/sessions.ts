@@ -1,5 +1,5 @@
-// Learn the CEO: extract the owner's own words from local Claude Code / Codex session history
-// (instructions, corrections, vetoes, trade-offs, taste) into a redacted digest that an agent distills
+// Learn the CEO: extract the owner's own words from local agent CLI session history (Claude Code, Codex, pi, omp;
+// opencode keeps sessions in a SQLite db and is not parsed) into a redacted digest that an agent distills
 // into memory/taste.md + principles. Raw transcripts never leave this machine; only the distilled
 // principles are synced to the shared data.
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
@@ -29,7 +29,8 @@ function hubInteractions(since: string): string {
 const STATE = join(HOME_DIR, "learn", "state.json");
 const OUT = join(HOME_DIR, "learn");
 
-type Turn = { ts: string; project: string; tool: "claude" | "codex"; text: string; prev?: string };
+type Turn = { ts: string; project: string; tool: string; text: string; prev?: string };
+type SessionReader = (file: string, tool: string) => Turn[];
 
 // ---------------------------------------------------------------- redaction
 const SECRET = [
@@ -63,8 +64,9 @@ function ownerText(raw: string): string | null {
 }
 
 // ---------------------------------------------------------------- readers
-function readClaude(file: string, project: string): Turn[] {
+function readClaude(file: string, tool: string): Turn[] {
   const out: Turn[] = [];
+  const project = basename(join(file, "..")).replace(/^-(home|Users)-[^-]+-/, "").replace(/^work-/, "").replace(/--claude-worktrees-.*$/, "");
   let lastAssistant = "";
   let fleet = false;
   for (const line of readFileSync(file, "utf8").split("\n")) {
@@ -81,12 +83,12 @@ function readClaude(file: string, project: string): Turn[] {
     const raw = typeof c === "string" ? c : Array.isArray(c) ? c.filter((x: any) => x.type === "text").map((x: any) => x.text).join("\n") : "";
     if (FLEET_PROMPT.test(raw)) { fleet = true; break; } // whole session is a fleet agent run
     const t = ownerText(raw);
-    if (t) out.push({ ts: l.timestamp ?? "", project, tool: "claude", text: t, prev: lastAssistant.slice(-400) });
+    if (t) out.push({ ts: l.timestamp ?? "", project, tool, text: t, prev: lastAssistant.slice(-400) });
   }
   return fleet ? [] : out;
 }
 
-function readCodex(file: string): Turn[] {
+function readCodex(file: string, tool: string): Turn[] {
   const out: Turn[] = [];
   let project = "codex", lastAssistant = "";
   for (const line of readFileSync(file, "utf8").split("\n")) {
@@ -101,10 +103,39 @@ function readCodex(file: string): Turn[] {
     if (p.role !== "user") continue;
     if (FLEET_PROMPT.test(txt)) return [];
     const t = ownerText(txt);
-    if (t) out.push({ ts: l.timestamp ?? "", project, tool: "codex", text: t, prev: lastAssistant.slice(-400) });
+    if (t) out.push({ ts: l.timestamp ?? "", project, tool, text: t, prev: lastAssistant.slice(-400) });
   }
   return out;
 }
+
+/** pi/omp session JSONL (omp derives from pi): the session line carries the cwd, message lines carry role + text content. */
+export function readPiStyle(file: string, tool: string): Turn[] {
+  const out: Turn[] = [];
+  let project = tool, lastAssistant = ""; // fallback when the session file has no cwd line (readCodex: "codex")
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    if (!line) continue;
+    let l: any; try { l = JSON.parse(line); } catch { continue; }
+    if (l.type === "session" && l.cwd) project = basename(l.cwd);
+    if (l.type !== "message") continue;
+    const m = l.message ?? {};
+    const txt = (m.content ?? []).filter((x: any) => x.type === "text").map((x: any) => x.text).join("\n");
+    if (m.role === "assistant") { if (txt) lastAssistant = txt; continue; }
+    if (m.role !== "user") continue;
+    if (FLEET_PROMPT.test(txt)) return []; // whole session is a fleet agent run
+    const t = ownerText(txt);
+    if (t) out.push({ ts: l.timestamp ?? "", project, tool, text: t, prev: lastAssistant.slice(-400) });
+  }
+  return out;
+}
+
+/** Session sources per CLI, in registry order. Config [learn] `<name>_dir` overrides the default root;
+ *  opencode is absent: its sessions live in a SQLite db (~/.local/share/opencode/opencode.db), not JSONL. */
+const SOURCES: { name: string; dir: string; read: SessionReader }[] = [
+  { name: "claude", dir: join(homedir(), ".claude", "projects"), read: readClaude },
+  { name: "codex", dir: join(homedir(), ".codex", "sessions"), read: readCodex },
+  { name: "pi", dir: join(homedir(), ".pi", "agent", "sessions"), read: readPiStyle },
+  { name: "omp", dir: join(homedir(), ".omp", "agent", "sessions"), read: readPiStyle },
+];
 
 function walk(dir: string, re: RegExp, acc: string[] = []): string[] {
   if (!existsSync(dir)) return acc;
@@ -119,20 +150,19 @@ function walk(dir: string, re: RegExp, acc: string[] = []): string[] {
 export function collect(cfg: Cfg, opts: { full?: boolean; maxChars?: number } = {}): { file: string | null; turns: number; sessions: number } {
   mkdirSync(OUT, { recursive: true });
   const state: Record<string, any> = !opts.full && existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : {};
-  const roots = cfg.learn ?? {};
-  const claudeDir = (roots.claude_dir ?? join(homedir(), ".claude", "projects")).replace(/^~/, homedir());
-  const codexDir = (roots.codex_dir ?? join(homedir(), ".codex", "sessions")).replace(/^~/, homedir());
-  const files = [...walk(claudeDir, /\.jsonl$/).map((f) => ["claude", f] as const), ...walk(codexDir, /\.jsonl$/).map((f) => ["codex", f] as const)];
+  const roots = (cfg.learn ?? {}) as Record<string, string>;
   const turns: Turn[] = [];
   let sessions = 0;
-  for (const [tool, f] of files) {
-    const m = statSync(f).mtimeMs;
-    if (typeof state[f] === "number" && state[f] >= m) continue;
-    if (Date.now() - m < 10 * 60_000) continue; // skip live sessions
-    const project = tool === "claude" ? basename(join(f, "..")).replace(/^-(home|Users)-[^-]+-/, "").replace(/^work-/, "").replace(/--claude-worktrees-.*$/, "") : "";
-    const t = tool === "claude" ? readClaude(f, project) : readCodex(f);
-    state[f] = m;
-    if (t.length) { sessions++; turns.push(...t); }
+  for (const s of SOURCES) {
+    const dir = (roots[`${s.name}_dir`] ?? s.dir).replace(/^~/, homedir());
+    for (const f of walk(dir, /\.jsonl$/)) {
+      const m = statSync(f).mtimeMs;
+      if (typeof state[f] === "number" && state[f] >= m) continue;
+      if (Date.now() - m < 10 * 60_000) continue; // skip live sessions
+      const t = s.read(f, s.name);
+      state[f] = m;
+      if (t.length) { sessions++; turns.push(...t); }
+    }
   }
   const hubSince = opts.full ? "" : (state.__hub_since as unknown as string) ?? "";
   const hub = existsSync(P("decisions")) ? hubInteractions(hubSince) : "";

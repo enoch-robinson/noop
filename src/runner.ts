@@ -1,11 +1,11 @@
 // Builds the prompt for an agent, runs Claude Code / Codex headless, parses the structured result.
-import { existsSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import {
   type Cfg, P, ROOT, agentActivity, agentName, precedents, readAll, readIf, recentJournal, signature,
 } from "./core";
-import { claudeDisallowed } from "./gates";
+import { byName, command as runCommand, parseStreamJson, type CliCtx, type RunEvents } from "./clis";
+import { gateList } from "./gates";
 
 export type Result = {
   status: "done" | "needs_decision" | "failed" | "delegated" | "waiting";
@@ -98,45 +98,16 @@ function rosterLine(): string {
     }).join("\n");
 }
 
-/** workspace-write only covers the cwd and /tmp; agents also need project checkouts, scratch, the hub and cargo's caches. */
-export function codexWritableDirs(home = homedir()): string[] {
-  const dirs = [join(home, "work"), join(home, ".noop", "work"), join(home, ".agent-hub", "work"), ROOT, join(home, ".cargo")];
-  const real = dirs.filter((d) => existsSync(d)).map((d) => realpathSync(d));
-  return [...new Set(real)];
-}
+export { codexWritableDirs } from "./clis";
 
+/** The command line for one agent run; [clis.<name>] command = [...] overrides the adapter's default. */
 export function cliCommand(cli: string, cfg: Cfg, gateOverride = false): string[] {
-  const c = cfg.clis?.[cli] ?? {};
-  if (Array.isArray(c.command)) return c.command;
-  if (cli === "claude") {
-    const cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", c.permission_mode ?? "bypassPermissions"];
-    cmd.push("--model", c.model ?? "claude-opus-5-5");
-    // the agent signature is the only attribution; drop Claude Code's own "Generated with" / co-author lines
-    cmd.push("--settings", JSON.stringify({ attribution: { commit: "", pr: "" }, includeCoAuthoredBy: false }));
-    const deny = claudeDisallowed(cfg, gateOverride);
-    if (deny.length) cmd.push("--disallowedTools", ...deny);
-    return cmd;
-  }
-  if (cli === "codex") {
-    // non-interactive: workspace-write sandbox with network, never ask for approval
-    const cmd = ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write",
-      "-c", 'approval_policy="never"', "-c", "sandbox_workspace_write.network_access=true"];
-    for (const dir of codexWritableDirs()) cmd.push("--add-dir", dir);
-    if (c.model) cmd.push("-m", c.model);
-    return [...cmd, "-"];
-  }
-  throw new Error(`unknown cli ${cli}`);
+  const ctx: CliCtx = { hub: ROOT, gates: gateList(cfg, gateOverride) };
+  return runCommand(cli, cfg, ctx);
 }
 
 /** Running agent processes by task id (so the owner can cancel one). */
 export const agentProcs = new Map<string, { kill: (sig?: number | NodeJS.Signals) => void }>();
-
-/** One line saying what a tool call does ("gh pr checks 814 -R longbridge/nsh", "读 src/cli.ts"), for "最近在做". */
-function toolStep(name: string, input: any): string {
-  const i = input ?? {};
-  const v = i.description || i.command || i.file_path || i.path || i.pattern || i.url || i.query || i.prompt || "";
-  return `${name}${v ? ` · ${String(v).split("\n")[0].slice(0, 120)}` : ""}`;
-}
 
 /** Marker runAgent appends when it stopped a run that went quiet (see stall_minutes). */
 export const STALLED = "\n[stalled]";
@@ -144,6 +115,7 @@ export const STALLED = "\n[stalled]";
 export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cfg, logFile: string, gateOverride = false,
   extraEnv: Record<string, string> = {}): Promise<string> {
   const cmd = cliCommand(cli, cfg, gateOverride);
+  const adapter = byName(cli);
   const timeoutMs = (cfg.clis?.timeout_minutes ?? 60) * 60_000;
   const stallMs = (cfg.clis?.stall_minutes ?? 20) * 60_000;
   const dir = cwd.replace(/^~/, homedir());
@@ -156,32 +128,23 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   if (tid) agentProcs.set(tid, proc);
   void proc.exited.then(() => { if (tid && agentProcs.get(tid) === proc) agentProcs.delete(tid); });
 
-  // what the agent is doing: every chunk of output is a sign of life; Claude's stream also names each step
-  const json = cmd.includes("stream-json");
-  const act = { at: Date.now(), step: undefined as string | undefined, steps: 0 };
-  const inFlight = new Map<string, string>(); // tool_use id → tool name, until its result comes back
-  let resultText: string | undefined, assistantText = "";
+  // what the agent is doing: every chunk of output is a sign of life; stream adapters also name each step
+  const ev: RunEvents = { step: undefined, steps: 0, assistantText: "", resultText: undefined, inFlight: new Map() };
+  // a stream adapter's output is parsed for steps and the report; anything else is returned as-is.
+  // Claude's stream-json shape is the fallback parser for unknown CLI names and codex (no parseEvent);
+  // a registered adapter's parseEvent always wins, even when a config command override emits another shape.
+  const json = cmd.includes("stream-json") || (!!adapter?.parseEvent && !adapter.streamJson);
+  const parse = adapter?.parseEvent ?? parseStreamJson;
+  const act = { at: Date.now() };
   const touch = () => {
     act.at = Date.now();
-    if (tid) agentActivity.set(tid, { at: new Date(act.at).toISOString(), step: act.step, steps: act.steps });
+    if (tid) agentActivity.set(tid, { at: new Date(act.at).toISOString(), step: ev.step, steps: ev.steps });
   };
   touch();
   const onLine = (line: string) => {
     let e: any;
     try { e = JSON.parse(line); } catch { return; }
-    if (e.type === "assistant") {
-      for (const c of e.message?.content ?? []) {
-        if (c.type === "tool_use") { inFlight.set(c.id, c.name); act.step = toolStep(c.name, c.input); act.steps++; }
-        else if (c.type === "text" && !e.parent_tool_use_id) assistantText += c.text;
-      }
-    } else if (e.type === "user") {
-      for (const c of e.message?.content ?? []) if (c.type === "tool_result") inFlight.delete(c.tool_use_id);
-    } else if (e.type === "result") {
-      // a background task finishing starts another turn with its own result, so keep every turn's text: the real report
-      // may be followed by "that notification changes nothing"
-      const text = typeof e.result === "string" ? e.result : "";
-      resultText = resultText === undefined ? text : `${resultText}\n\n${text}`;
-    }
+    parse(e, ev);
   };
   const read = async (stream: ReadableStream<Uint8Array>, lines: boolean) => {
     const dec = new TextDecoder();
@@ -206,7 +169,7 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   const timer = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
   // a run that has gone quiet: no output at all, and nothing slow in flight (a sub-agent may work quietly for long)
   const watch = setInterval(() => {
-    const slow = [...inFlight.values()].some((n) => /^(Task|Agent)$/.test(n));
+    const slow = [...ev.inFlight.values()].some((n) => /^(Task|Agent)$/.test(n));
     if (!slow && Date.now() - act.at > stallMs) { stalled = true; proc.kill(); }
   }, 30_000);
   const [raw, err] = await Promise.all([read(proc.stdout, json), read(proc.stderr, false)]);
@@ -216,9 +179,9 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   if (tid) agentActivity.delete(tid);
   mkdirSync(P("logs", "runs"), { recursive: true });
   writeFileSync(logFile, `$ ${cmd.join(" ")}\n(exit ${code})\n\n${raw}\n\n[stderr]\n${err}`);
-  const out = json ? (resultText ?? assistantText) : raw;
-  if (timedOut) return `${out}${STALLED} hit the ${Math.round(timeoutMs / 60_000)}-minute run limit (clis.timeout_minutes)${act.step ? `; last step: ${act.step}` : ""}; run long builds in the background and return "waiting"`;
-  if (stalled) return `${out}${STALLED} no output for ${Math.round(stallMs / 60_000)} minutes${act.step ? `; last step: ${act.step}` : ""}`;
+  const out = json ? (ev.resultText ?? ev.assistantText) : raw;
+  if (timedOut) return `${out}${STALLED} hit the ${Math.round(timeoutMs / 60_000)}-minute run limit (clis.timeout_minutes)${ev.step ? `; last step: ${ev.step}` : ""}; run long builds in the background and return "waiting"`;
+  if (stalled) return `${out}${STALLED} no output for ${Math.round(stallMs / 60_000)} minutes${ev.step ? `; last step: ${ev.step}` : ""}`;
   return out + (code ? `\n[exit ${code}] ${err.slice(-2000)}` : "");
 }
 
@@ -234,17 +197,17 @@ export function parseResult(out: string): Result {
 }
 
 /** The models that route each owner message, fastest first: a choice made within seconds, not a judgement.
- * `[router] cli/model` in config.toml puts one first; the others are fallbacks when its CLI is missing or fails. */
-const ROUTERS = [{ cli: "claude", model: "claude-haiku-5-5" }, { cli: "codex", model: "gpt-6-luna" }];
+ *  `[router] cli/model` in config.toml puts one first; the others are fallbacks when its CLI is missing or fails. */
+const ROUTERS = [{ cli: "claude", model: "claude-haiku-5-5" }, { cli: "codex", model: "gpt-6-luna" }, { cli: "pi" }, { cli: "omp" }];
 
 /** One quick structured call for routing (the fastest model available); null when none answered. */
 export async function quickAsk(prompt: string, cfg: Cfg, logFile: string): Promise<any> {
   const own = cfg.router?.cli ? [{ cli: String(cfg.router.cli), model: String(cfg.router.model ?? "") }] : [];
   for (const r of [...own, ...ROUTERS.filter((x) => x.cli !== own[0]?.cli)]) {
     if (!Bun.which(r.cli)) continue;
-    const cmd = r.cli === "claude"
-      ? ["claude", "-p", "--output-format", "text", "--tools", "", "--strict-mcp-config", ...(r.model ? ["--model", r.model] : [])]
-      : ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", ...(r.model ? ["-m", r.model] : []), "-c", 'model_reasoning_effort="low"', "-"];
+    const a = byName(r.cli);
+    if (!a) continue;
+    const cmd = a.routerCommand(r.model || undefined);
     const proc = Bun.spawn(cmd, { cwd: ROOT, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" });
     const timer = setTimeout(() => proc.kill("SIGKILL"), (cfg.router?.timeout_seconds ?? 45) * 1000);
     const out = await new Response(proc.stdout).text();
@@ -260,10 +223,9 @@ export async function quickAsk(prompt: string, cfg: Cfg, logFile: string): Promi
 
 /** One-shot structured call (used by the judge). */
 export async function ask(prompt: string, cfg: Cfg, logFile: string): Promise<any> {
-  const cli = cfg.judge?.cli ?? "claude";
-  const cmd = cli === "claude"
-    ? ["claude", "-p", "--output-format", "text", "--model", cfg.judge?.model ?? "claude-opus-5-5", "--tools", ""]
-    : ["codex", "exec", "--skip-git-repo-check", "-"];
+  const a = byName(cfg.judge?.cli ?? "claude");
+  if (!a) return null; // unregistered judge CLI: same net result as a failed call
+  const cmd = a.judgeCommand(cfg.judge?.model);
   const proc = Bun.spawn(cmd, { cwd: ROOT, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" });
   const timer = setTimeout(() => proc.kill("SIGKILL"), (cfg.judge?.timeout_minutes ?? 10) * 60_000); // runs inside locked()
   const out = await new Response(proc.stdout).text();
