@@ -9,14 +9,37 @@ inputs:
   target:
     description: linux, windows, macos, ios, android or web
     required: true
+  rust-target:
+    description: Rust target triple for cross-compiling the macOS CLI and runtime (optional)
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
+    # The linked SDK controls UIKit's appearance. Include the toolchain in the
+    # cache key so upgrading Xcode cannot silently reuse an old native runtime.
+    - id: apple-sdk
+      if: inputs.target == 'ios'
+      shell: bash
+      run: |
+        sdk="$(xcrun --sdk iphoneos --show-sdk-version)"
+        if [ "${sdk%%.*}" -lt 27 ]; then
+          echo "::error::Noop needs iOS SDK 27 or newer; selected SDK is $sdk"
+          exit 1
+        fi
+        toolchain="$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)"
+        echo "key=-sdk-$sdk-$toolchain" >> "$GITHUB_OUTPUT"
+
     - id: cache
       uses: actions/cache@v4
       with:
         path: ~/.nsh-dist
-        key: nsh-dist-${{ runner.os }}-${{ inputs.target }}-${{ inputs.ref }}
+        key: nsh-dist-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ inputs.ref }}${{ steps.apple-sdk.outputs.key }}${{ inputs.target == 'macos' && format('-{0}', inputs.rust-target || 'native') || '' }}
+
+    # The x86_64 CLI also generates x86_64 OTA archive names. It needs Rosetta even on cache hits.
+    - if: runner.os == 'macOS' && runner.arch == 'ARM64' && inputs.rust-target == 'x86_64-apple-darwin'
+      shell: bash
+      run: sudo softwareupdate --install-rosetta --agree-to-license
 
     # `nsh package` needs a JDK and the SDK's platform for Android, cached or not.
     - if: inputs.target == 'android'
@@ -38,8 +61,12 @@ runs:
         repository: longbridge/nsh
         ref: ${{ inputs.ref }}
         path: .nsh-src
+        # Keep the native build's host tools when cross-compiling Intel on the same Mac runner.
+        clean: ${{ inputs.target != 'macos' || inputs.rust-target == '' }}
     - if: steps.cache.outputs.cache-hit != 'true'
       uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.rust-target }}
 
     # Linux runtime libraries are needed even when the built NSH distribution is cached.
     - if: runner.os == 'Linux' && (steps.cache.outputs.cache-hit != 'true' || inputs.target == 'linux')
@@ -63,12 +90,20 @@ runs:
       working-directory: .nsh-src
       env:
         TARGET: ${{ inputs.target }}
+        RUST_TARGET: ${{ inputs.rust-target }}
       run: |
         out="$HOME/.nsh-dist"
         exe=""; [ "$RUNNER_OS" != Windows ] || exe=.exe
-        cargo build --release --locked -p nsh-cli
+        target_args=()
+        release_dir=target/release
+        if [ -n "$RUST_TARGET" ]; then
+          [ "$TARGET" = macos ] || { echo "::error::rust-target is supported only for macos"; exit 1; }
+          target_args=(--target "$RUST_TARGET")
+          release_dir="target/$RUST_TARGET/release"
+        fi
+        cargo build --release --locked -p nsh-cli "${target_args[@]}"
         install -d "$out/bin"
-        cp "target/release/nsh$exe" "$out/bin/"
+        cp "$release_dir/nsh$exe" "$out/bin/"
         case "$TARGET" in
           linux)
             # noop shows no web views, so the app needs only GTK 4 and not WebKitGTK.
@@ -78,10 +113,11 @@ runs:
             cargo build --release --locked -p nsh-windows-app
             install -d "$out/runtime/windows"; cp target/release/nsh-windows-app.exe "$out/runtime/windows/" ;;
           macos)
-            cargo build --release --locked -p nsh-macos-app
-            install -d "$out/runtime/macos"; cp target/release/nsh-macos-app "$out/runtime/macos/" ;;
+            cargo build --release --locked -p nsh-macos-app "${target_args[@]}"
+            install -d "$out/runtime/macos"; cp "$release_dir/nsh-macos-app" "$out/runtime/macos/" ;;
           ios)
-            cargo build --release --locked -p nsh-ios-app --target aarch64-apple-ios
+            rustup target add aarch64-apple-ios
+            SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" cargo build --release --locked -p nsh-ios-app --target aarch64-apple-ios
             install -d "$out/runtime/ios/iphoneos"; cp target/aarch64-apple-ios/release/nsh-ios-app "$out/runtime/ios/iphoneos/" ;;
           android)
             cargo xtask android --release
@@ -101,6 +137,17 @@ runs:
             cp "$(dirname "$two_face")/generated/syntaxes-fancy-newlines.bin" "$out/runtime/web/nsh-syntaxes.bin" ;;
           *) echo "::error::unknown target $TARGET"; exit 1 ;;
         esac
+
+    # Preserve the expensive macOS build even if a later packaging or validation step fails.
+    - if: inputs.target == 'macos' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.nsh-dist
+        key: nsh-dist-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ inputs.ref }}-${{ inputs.rust-target || 'native' }}
+
+    - if: inputs.target == 'ios'
+      shell: bash
+      run: bash "$GITHUB_WORKSPACE/scripts/check-ios-sdk.sh" "$HOME/.nsh-dist/runtime/ios/iphoneos/nsh-ios-app"
 
     - shell: bash
       run: |

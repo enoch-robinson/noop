@@ -116,3 +116,29 @@ test("primary: named in the config, else only while no other host has a heartbea
   expect(core.isPrimary({}, "pc")).toBe(true); // its own heartbeat does not count
   expect(core.isPrimary({ fleet: { primary: "mac" } }, "mac")).toBe(true);
 });
+
+test("per-machine routine (scheduler each): copies on other machines neither block nor get superseded", () => {
+  const t = (dir: string, id: string, host: string) => writeDoc(P("tasks", dir, `${id}.md`), { id, host, source: "routine:security-check", created: new Date().toISOString() }, "");
+  t("active", "T-0201", "mac");
+  t("proposed", "T-0202", "mac");
+  expect(A.routineQueued("security-check", "linux")).toBe("");
+  expect(A.routineQueued("security-check", "mac")).toBe("T-0201");
+  t("proposed", "T-0203", "linux");
+  expect(A.supersedeProposed("security-check", "T-0203", "linux")).toEqual([]);
+  expect(existsSync(P("tasks", "proposed", "T-0202.md"))).toBe(true);
+});
+
+test("built-in routines: every config has security-check (read-only, each machine); config.toml can replace it", async () => {
+  const { writeFileSync } = await import("node:fs");
+  mkdirSync(P(), { recursive: true });
+  writeFileSync(P("config.toml"), "");
+  let r = core.loadConfig().routine.find((x: any) => x.name === "security-check");
+  expect(r).toMatchObject({ builtin: true, readonly: true, scheduler: "each", every: "weekly MON 09:00" });
+  expect(A.needsApproval(core.loadConfig(), "routine:security-check")).toBe(false);
+  writeFileSync(P("config.toml"), '[[routine]]\nname = "security-check"\nevery = "daily 08:00"\nagent = "lead"\nprompt = "x"\n');
+  r = core.loadConfig().routine.filter((x: any) => x.name === "security-check");
+  expect(r).toHaveLength(1);
+  expect(r[0].every).toBe("daily 08:00");
+  expect(r[0].builtin).toBeUndefined();
+  rmSync(P("config.toml"));
+});

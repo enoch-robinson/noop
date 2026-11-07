@@ -29,11 +29,12 @@ const QUEUED = ["inbox", "active", "waiting", "blocked"];
 const PARKED_COPY_MS = 6 * 3600_000;
 const isRoutine = (m: Record<string, string>, name: string) => (m.source ?? "").replace(/^approved:/, "") === `routine:${name}`;
 
-/** Id of a copy of this routine that is queued or running (so a new run would be redundant), else "". */
-export function routineQueued(name: string): string {
+/** Id of a copy of this routine that is queued or running (so a new run would be redundant), else "".
+ *  `host`: a per-machine routine (scheduler "each") only counts its own machine's copies. */
+export function routineQueued(name: string, host?: string): string {
   for (const s of QUEUED) for (const p of list(P("tasks", s), /^T-.*\.md$/)) {
     const m = readDoc(p).meta;
-    if (!isRoutine(m, name)) continue;
+    if (!isRoutine(m, name) || (host && m.host !== host)) continue;
     // an old copy parked on something slow (the owner clicking merge) must not starve the routine's other work
     if ((s === "waiting" || s === "blocked") && Date.now() - Date.parse(m.created ?? "") > PARKED_COPY_MS) continue;
     return m.id;
@@ -42,11 +43,11 @@ export function routineQueued(name: string): string {
 }
 
 /** A newer run of a routine replaces its older unapproved copies: move them to rejected with a note. */
-export function supersedeProposed(name: string, newId: string): string[] {
+export function supersedeProposed(name: string, newId: string, host?: string): string[] {
   const out: string[] = [];
   for (const p of list(P("tasks", "proposed"), /^T-.*\.md$/)) {
     const { meta, body } = readDoc(p);
-    if (meta.id === newId || !isRoutine(meta, name)) continue;
+    if (meta.id === newId || !isRoutine(meta, name) || (host && meta.host !== host)) continue;
     writeDoc(P("tasks", "rejected", `${meta.id}.md`), { ...meta, approval: `superseded:${newId}` }, body + `\n\n## Note\nsuperseded by ${newId}\n`);
     unlinkSync(p);
     out.push(meta.id);

@@ -9,6 +9,7 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/actions/setup-nsh/**
+      - scripts/check-ios-sdk.sh
       - install-client.sh
       - install-client.ps1
       - app/build-web.sh
@@ -23,8 +24,8 @@ concurrency:
 
 env:
   # NSH main with OTA updates through signed packages (longbridge/nsh#1189), the Android bindgen fix for NDK 27, and
-  # checkForUpdate leaving the whole app alone while a package of its release runs (longbridge/nsh#1207), and the Linux tray painting an SVG icon as a template (longbridge/nsh#1209).
-  NSH_REF: b2d1b1c45b9b3ffd66dad573b62b3e08ebb4f45e
+  # checkForUpdate leaving the whole app alone while a package of its release runs (longbridge/nsh#1207), the Linux tray painting an SVG icon as a template (longbridge/nsh#1209), and shellInfo() for the installed app's version and NSH runtime (longbridge/nsh#1226).
+  NSH_REF: a45c403e08d59453a259943deb77acbd96dcdbe9
 
 defaults:
   run:
@@ -40,7 +41,7 @@ jobs:
           - { target: linux, os: ubuntu-24.04, asset: Noop-linux-x86_64.tar.gz, installer: install-client.sh }
           - { target: windows, os: windows-latest, asset: Noop-windows-x86_64.zip, installer: install-client.ps1 }
           - { target: macos, os: macos-15, asset: Noop-macos-arm64.zip, installer: install-client.sh }
-          - { target: ios, os: macos-15, asset: Noop-ios-unsigned.ipa }
+          - { target: ios, os: xcode-27, asset: Noop-ios-unsigned.ipa }
           - { target: android, os: ubuntu-24.04, asset: Noop-android.apk }
           - { target: web, os: ubuntu-24.04, asset: Noop-web.tar.gz }
     runs-on: ${{ matrix.os }}
@@ -88,12 +89,25 @@ jobs:
             windows) mv "$out/Noop.zip" "assets/$ASSET"; mv "$out"/Noop-*.zip assets/ ;;
             macos) ditto -c -k --keepParent "$out/Noop.app" "assets/$ASSET"; mv "$out"/Noop-*.tar.gz assets/ ;;
             ios)
+              executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$out/Noop.app/Info.plist")
+              bash scripts/check-ios-sdk.sh "$out/Noop.app/$executable"
               # Unsigned: sign it with your own Apple ID to install it (Sideloadly, AltStore).
               mkdir "$out/Payload" && mv "$out/Noop.app" "$out/Payload/"
               (cd "$out" && zip -qry - Payload) > "assets/$ASSET" ;;
             android) mv "$out/Noop.apk" "assets/$ASSET" ;;
           esac
           ls -l assets
+
+      - name: Verify the macOS package
+        if: matrix.target == 'macos'
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          app="$RUNNER_TEMP/verify/Noop.app"
+          ditto -x -k "assets/$ASSET" "$RUNNER_TEMP/verify"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          lipo "$app/Contents/MacOS/$executable" -verify_arch arm64
+          codesign --verify --deep --strict "$app"
 
       - name: Try the installer on this package
         if: matrix.installer != ''
@@ -122,6 +136,41 @@ jobs:
               grep -q "^Exec=$HOME/.local/share/noop-client/Noop" "$HOME/.local/share/applications/dev.noop.app.desktop" ;;
           esac
           rm assets/SHA256SUMS
+
+      # Reuse this ARM runner for Intel after packaging and testing the native app.
+      # The installer currently supports only Apple silicon; Intel users download the archive.
+      - name: Set up Intel nsh
+        if: matrix.target == 'macos'
+        uses: ./.github/actions/setup-nsh
+        with:
+          ref: ${{ env.NSH_REF }}
+          target: macos
+          rust-target: x86_64-apple-darwin
+
+      - name: Package and verify Intel macOS
+        if: matrix.target == 'macos'
+        run: |
+          args=(--build "$GITHUB_RUN_NUMBER")
+          [ "$GITHUB_REF_TYPE" != tag ] || args+=(--app-version "${GITHUB_REF_NAME#v}")
+          out="$RUNNER_TEMP/out-x86_64"
+          mkdir -p assets-intel
+          # The Intel CLI runs through Rosetta and also names OTA archives macos-x86_64.
+          (cd app && nsh package --target macos -o "$out" "${args[@]}")
+          ditto -c -k --keepParent "$out/Noop.app" assets-intel/Noop-macos-x86_64.zip
+          mv "$out"/Noop-*-macos-x86_64.tar.gz assets-intel/
+          app="$RUNNER_TEMP/verify-x86_64/Noop.app"
+          ditto -x -k assets-intel/Noop-macos-x86_64.zip "$RUNNER_TEMP/verify-x86_64"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          lipo "$app/Contents/MacOS/$executable" -verify_arch x86_64
+          codesign --verify --deep --strict "$app"
+
+      - name: Upload Intel macOS package
+        if: matrix.target == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Noop-macos-x86_64.zip
+          path: assets-intel/
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         with:

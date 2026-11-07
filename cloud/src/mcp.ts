@@ -39,7 +39,8 @@ export interface McpHost {
   /** Email-code sign-in, reused from /api/auth/*. */
   startCode(email: string): Promise<{ status: number; body: any }>;
   /** Checks the code; on success returns the email (no browser session is created). */
-  checkCode(email: string, code: string): Promise<{ email?: string; error?: string }>;
+  /** Email code + the authenticator's TOTP (mandatory second factor). */
+  checkCode(email: string, code: string, totp: string, ctx?: { req: Request; via: string }): Promise<{ email?: string; error?: string }>;
   /** Creates an owner session for this email; returns the raw bearer token. */
   newSession(email: string, ua: string): Promise<string>;
   dropSession(raw: string): Promise<void>;
@@ -111,7 +112,7 @@ const MCP_TOOLS = toolsFor("mcp");
 //   "g"      the session's standalone GET stream (one live connection per session; a new GET replaces the old one)
 //   "p<hex>" the SSE response to one POST (progress notifications, then the JSON-RPC response)
 type Live = { session: string; stream: string; write: (s: string) => void; close: () => void };
-type Who = "machine" | { session: string };
+type Who = "machine" | { session: string; scope?: string };
 type Ctx = { signal?: AbortSignal; progress?: (progress: number, total?: number, message?: string) => void };
 
 export const SESSION_IDLE_MS = 24 * 3600_000;
@@ -484,6 +485,7 @@ export class Mcp {
     const client = this.client(f.client_id ?? "");
     if (!client) return page("无法授权", `<p>未知的应用（client_id）。请在客户端里重新添加 Noop。</p>`, 400);
     if (!client.redirect_uris.includes(f.redirect_uri)) return page("无法授权", `<p>回调地址和注册的不一致。</p>`, 400);
+    if (!okRedirect(f.redirect_uri)) return page("无法授权", `<p>这个回调地址不在允许范围内。</p>`, 400); // clients registered before the host allow-list
     const back = (q: Record<string, string>) => {
       const u = new URL(f.redirect_uri);
       for (const [k, v] of Object.entries({ ...q, ...(f.state ? { state: f.state } : {}) })) u.searchParams.set(k, v);
@@ -503,7 +505,9 @@ export class Mcp {
     const codeForm = (msg = "") => page("授权 Noop", `${who}${msg}<form method="post">${keep}<input type="hidden" name="step" value="verify">
       <input type="hidden" name="email" value="${esc(f.email)}">
       <label>验证码（已发到 ${esc(f.email)}${f.delivery === "cli" ? "；邮件未配置，请在你的电脑上运行 <code>noop login</code> 查看" : ""}）
-      <input name="code" inputmode="numeric" pattern="\\d{6}" maxlength="6" required autofocus autocomplete="one-time-code"></label>
+      <input name="code" autocapitalize="characters" autocorrect="off" spellcheck="false" maxlength="12" required autofocus autocomplete="one-time-code" style="text-transform:uppercase;letter-spacing:.15em"></label>
+      <label>两步验证码（验证器 App 上的 6 位数字）
+      <input name="totp" inputmode="numeric" pattern="\\d{6}" maxlength="6" required autocomplete="off"></label>
       <input type="hidden" name="delivery" value="${esc(f.delivery)}">
       <div class="row"><button>授权</button><button name="step" value="deny" class="ghost" formnovalidate>拒绝</button></div></form>`);
     const note = (s: string) => `<p class="err">${esc(s)}</p>`;
@@ -511,12 +515,13 @@ export class Mcp {
     if (req.method !== "POST") return emailForm();
     if (f.step === "send") {
       const r = await this.h.startCode(String(f.email ?? ""));
-      if (r.status !== 200) return emailForm(note(r.body?.error ?? "发送失败"));
+      if (r.status !== 200) return emailForm(note(r.body?.message ?? r.body?.error ?? "发送失败"));
       f.delivery = r.body?.delivery ?? "";
       return codeForm();
     }
     if (f.step === "verify") {
-      const r = await this.h.checkCode(String(f.email ?? ""), String(f.code ?? ""));
+      const r = await this.h.checkCode(String(f.email ?? ""), String(f.code ?? ""), String(f.totp ?? ""),
+        { req, via: `MCP 连接器授权：${String(client.client_name).slice(0, 60)}（回调 ${new URL(f.redirect_uri).host}）` });
       if (!r.email) return codeForm(note(r.error ?? "验证码不对"));
       const code = rand(32);
       this.h.sql.exec("DELETE FROM oauth_codes WHERE expires < ?", Date.now());
@@ -560,9 +565,17 @@ export class Mcp {
 }
 
 const err = (id: unknown, code: number, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
+// Connectors that may receive an authorization code: Claude (claude.ai / claude.com) and ChatGPT, plus local clients
+// (Claude Code, MCP Inspector) on loopback. A code sent anywhere else would hand the owner's fleet to that site.
+const REDIRECT_HOSTS = ["claude.ai", "claude.com", "chatgpt.com", "chat.openai.com"];
+const LOOPBACK = ["localhost", "127.0.0.1", "[::1]"];
 export function okRedirect(u: string) {
-  try { const x = new URL(u); return !x.hash && (x.protocol === "https:" || (x.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(x.hostname))); }
-  catch { return false; }
+  try {
+    const x = new URL(u);
+    if (x.hash || x.username || x.password) return false;
+    if (LOOPBACK.includes(x.hostname)) return x.protocol === "http:" || x.protocol === "https:";
+    return x.protocol === "https:" && !x.port && REDIRECT_HOSTS.some((h) => x.hostname === h || x.hostname.endsWith(`.${h}`));
+  } catch { return false; }
 }
 
 function page(title: string, body: string, status = 200) {

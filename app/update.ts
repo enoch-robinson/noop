@@ -122,3 +122,17 @@ export function compareVersions(a: string, b: string): number {
   }
   return 0;
 }
+
+/** `nsh/updater`'s `shellInfo()`: the installed app (its shell) and the NSH runtime built into it. */
+export type ShellInfo = { version: string | null; build: number | null; nshVersion: string; packages: boolean };
+
+/**
+ * The shell's line in the version list. `info` undefined: the runtime predates `shellInfo`, which says nothing about
+ * whether it takes packages (shells from 0.2.1 do), so there is no line.
+ */
+export function shellLine(info: ShellInfo | undefined, os: string): { text: string; tone: "ok" | "bad" } | null {
+  const phone = os === "ios" || os === "android";
+  if (!info) return null;
+  if (phone && !info.packages) return { text: "no-packages", tone: "bad" };
+  return { text: `${info.version ?? "dev"}${info.build != null ? ` (${info.build})` : ""} · NSH ${info.nshVersion}`, tone: "ok" };
+}

@@ -424,3 +424,61 @@ export async function runTool(st: ToolStore, name: string, a: any, base = ""): P
   }
   return bad(`unknown tool: ${name}`);
 }
+
+// ---------------------------------------------------------------- channels
+// A channel is a work topic the AI opens (like a Slack channel in a company): "NSH i18n", "Omamail". Stored as
+// channels/<slug>.md (name, goal, status, created); tasks carry `channels: a,b`. Read-only drill-down views of the main chat.
+export type ChannelRow = { slug: string; name: string; goal: string; status: "active" | "archived"; created: string };
+export type ChannelItem = { id: string; kind: "task" | "decision"; title: string; state: string; updated: string; task?: string };
+export const CHANNEL_SLUG = /^[a-z0-9][a-z0-9-]{0,47}$/;
+export const STALE_DAYS = 7;
+
+export function slugify(name: string): string {
+  const ascii = name.toLowerCase().normalize("NFKD").replace(/[^\x00-\x7f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48).replace(/-+$/, "");
+  if (ascii) return ascii;
+  let h = 0; for (const c of name) h = (h * 31 + c.codePointAt(0)!) >>> 0; // all CJK: a stable short id
+  return `ch-${h.toString(36)}`;
+}
+
+export const taskChannels = (meta: Record<string, string>) => (meta.channels ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+
+export function parseChannel(path: string, text: string): ChannelRow | null {
+  const slug = path.split("/").pop()!.replace(/\.md$/, "");
+  if (!CHANNEL_SLUG.test(slug)) return null;
+  const { meta, body } = parseDoc(text);
+  return { slug, name: meta.name || slug, goal: (meta.goal ?? body).trim(), status: meta.status === "archived" ? "archived" : "active", created: meta.created ?? "" };
+}
+
+export function listChannelRows(st: ToolStore): ChannelRow[] {
+  return st.list("channels/").filter((f) => /^channels\/[^/]+\.md$/.test(f.path)).map((f) => parseChannel(f.path, f.text)).filter((c): c is ChannelRow => !!c)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Every channel with its items (tasks + the cards they asked), newest first; `stale` = no activity for STALE_DAYS. */
+export function channelsView(st: ToolStore, nowMs = Date.now(), limit = 100) {
+  const chans = listChannelRows(st);
+  const items = new Map<string, ChannelItem[]>(chans.map((c) => [c.slug, []]));
+  const taskOf = new Map<string, string[]>(); const seen = new Set<string>();
+  for (const s of HISTORY_STATES) for (const f of st.list(`tasks/${s}/`)) {
+    if (!/^tasks\/[^/]+\/T-[^/]*\.md$/.test(f.path)) continue;
+    const { meta } = parseDoc(f.text);
+    const cs = taskChannels(meta).filter((c) => items.has(c));
+    const id = meta.id || f.path.split("/").pop()!.replace(/\.md$/, "");
+    if (!cs.length || seen.has(id)) continue;
+    seen.add(id); taskOf.set(id, cs);
+    const row = historyRow(f, s);
+    for (const c of cs) items.get(c)!.push({ id, kind: "task", title: row.title, state: s, updated: String(row.updated ?? "") });
+  }
+  for (const w of ["open", "closed"]) for (const d of st.list(`decisions/${w}/`)) {
+    const { meta } = parseDoc(d.text);
+    const cs = meta.task ? taskOf.get(meta.task) : undefined;
+    if (!cs || !meta.id) continue;
+    for (const c of cs) items.get(c)!.push({ id: meta.id, kind: "decision", title: meta.question ?? meta.id, state: w, updated: meta.answered ?? meta.created ?? d.updated, task: meta.task });
+  }
+  return { channels: chans.map((c) => {
+    const list = items.get(c.slug)!.sort((a, b) => b.updated.localeCompare(a.updated));
+    const last = list[0]?.updated ?? c.created;
+    const stale = !last || nowMs - Date.parse(last) > STALE_DAYS * 86_400_000;
+    return { ...c, last_activity: last, stale, count: list.length, items: list.slice(0, limit) };
+  }) };
+}

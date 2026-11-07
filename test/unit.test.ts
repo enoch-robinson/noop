@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { due } from "../src/cli";
@@ -235,6 +235,78 @@ test("a result block survives a later turn from a background task notification",
   rmSync(log, { force: true });
   expect(res).toMatchObject({ status: "done", summary: "tested" });
 });
+
+test("an empty completion (no text, no tool call, exit 0) is retried once instead of failing the task", async () => {
+  // The provider sometimes answers with nothing at all and the CLI still exits 0; Claude Code's own
+  // "no visible output" retry gets nothing either. runAgent must not hand that back as the task's result.
+  const dir = mkdtempSync(`${tmpdir()}/noop-empty-`);
+  const mark = `${dir}/ran`;
+  const block = JSON.stringify({ type: "result", result: '```json\n{"status":"done","summary":"second try"}\n```' });
+  // first spawn: no output at all; second one: the normal result line (a marker file carries the state)
+  const script = `const fs = require("node:fs");`
+    + `if (fs.existsSync(${JSON.stringify(mark)})) process.stdout.write(${JSON.stringify(`${block}\n`)});`
+    + `else fs.writeFileSync(${JSON.stringify(mark)}, "");`;
+  const cfg = { clis: { fake: { command: [process.execPath, "-e", script, "stream-json"] } } } as unknown as Cfg;
+  const log = `${dir}/run.log`;
+  try {
+    const res = parseResult(await runAgent("fake", "prompt", dir, cfg, log));
+    expect(res).toMatchObject({ status: "done", summary: "second try" });
+    expect(readFileSync(log, "utf8")).toContain("[retried after an empty response]");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("a completed tool call with an empty result is not retried", async () => {
+  // A stream that already ran a tool and then ended with result:"" must not be replayed: the first run may have
+  // posted, committed, or done other work, and a fresh prompt would repeat it.
+  const dir = mkdtempSync(`${tmpdir()}/noop-tool-empty-`);
+  const counter = `${dir}/n`;
+  const lines = [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "echo hi" } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "hi" }] } },
+    { type: "result", result: "" },
+  ].map((l) => JSON.stringify(l)).join("\n");
+  const script = `const fs = require("node:fs");`
+    + `const p = ${JSON.stringify(counter)};`
+    + `fs.writeFileSync(p, String(Number(fs.existsSync(p) ? fs.readFileSync(p, "utf8") : 0) + 1));`
+    + `process.stdout.write(${JSON.stringify(`${lines}\n`)});`;
+  const cfg = { clis: { fake: { command: [process.execPath, "-e", script, "stream-json"] } } } as unknown as Cfg;
+  const log = `${dir}/run.log`;
+  try {
+    const out = await runAgent("fake", "prompt", dir, cfg, log);
+    expect(out.trim()).toBe("");
+    expect(Number(readFileSync(counter, "utf8"))).toBe(1);
+    expect(readFileSync(log, "utf8")).not.toContain("[retried after an empty response]");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("visible assistant text with an empty result is not retried", async () => {
+  // An empty result currently masks earlier visible assistant text via `resultText ?? assistantText`; that must not
+  // trigger a replay either.
+  const dir = mkdtempSync(`${tmpdir()}/noop-text-empty-`);
+  const counter = `${dir}/n`;
+  const lines = [
+    { type: "assistant", message: { content: [{ type: "text", text: "I looked around" }] } },
+    { type: "result", result: "" },
+  ].map((l) => JSON.stringify(l)).join("\n");
+  const script = `const fs = require("node:fs");`
+    + `const p = ${JSON.stringify(counter)};`
+    + `fs.writeFileSync(p, String(Number(fs.existsSync(p) ? fs.readFileSync(p, "utf8") : 0) + 1));`
+    + `process.stdout.write(${JSON.stringify(`${lines}\n`)});`;
+  const cfg = { clis: { fake: { command: [process.execPath, "-e", script, "stream-json"] } } } as unknown as Cfg;
+  const log = `${dir}/run.log`;
+  try {
+    const out = await runAgent("fake", "prompt", dir, cfg, log);
+    expect(out.trim()).toBe("");
+    expect(Number(readFileSync(counter, "utf8"))).toBe(1);
+    expect(readFileSync(log, "utf8")).not.toContain("[retried after an empty response]");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
 
 test("status: a task parked on something slow stays listed however many tasks finished after it", async () => {
   const { status } = await import("../src/server");

@@ -28,8 +28,10 @@ import { parseSlackPayload, verifySlack } from "./slack";
 import { parseDiscordClick, verifyDiscord } from "./discord";
 import { b64dec, b64enc, handleFiles, handleReadFiles, initFilesSchema } from "./files";
 import { FREE, LEAN, SHED, TARGET, latestOnly } from "./budget";
-import { taskHistory, taskInfo } from "./tools";
-import { ownerAttachments, sniffImage, uploadId, uploadProblem } from "./uploads";
+import { CHANNEL_SLUG, channelsView, taskHistory, taskInfo } from "./tools";
+import { CODE_RE, newCode, normCode } from "./authcode";
+import { newSecret, otpauthUri, totpMatch } from "./totp";
+import { mediaHeaders, ownerAttachments, sniffImage, uploadId, uploadProblem } from "./uploads";
 import { sendMail, type SmtpCfg } from "./smtp";
 import { EmailMessage } from "cloudflare:email";
 
@@ -42,6 +44,7 @@ async function cfMail(binding: SendEmail, from: string, to: string, subject: str
 }
 import { sendPush, type PushSub, type Vapid } from "./push";
 import { CORS, Mcp } from "./mcp";
+import { ipAllowed, parseAllowList } from "./ipallow";
 import { notificationFor, type NotifyRules } from "../../app/notify";
 
 interface Env {
@@ -56,7 +59,9 @@ interface Env {
   HUB_SLACK_SIGNING_SECRET?: string; // Slack button clicks (/api/slack/interactive): the Slack app's signing secret
   HUB_DISCORD_PUBLIC_KEY?: string;   // Discord button clicks (/api/discord/interactive): the app's Ed25519 public key (hex)
   HUB_ANSWER_TOKEN?: string;         // answer-only bearer for ntfy banner buttons: their Actions header hands the
-}                                  // token to the ntfy server (a third party), so it must never be HUB_TOKEN
+  // token to the ntfy server (a third party), so it must never be HUB_TOKEN; scoped to POST /api/answer below
+  HUB_ALLOW_IPS?: string;   // optional source-IP allow-list (IPs / CIDRs, comma or space separated); set → everyone else gets 403
+}
 
 const json = (d: unknown, status = 200) => Response.json(d, { status });
 const CHUNK = 1_000_000; // SQLite row limit is 2 MB
@@ -66,6 +71,12 @@ const STALE_MS = 3 * 60_000;
 const SHEDDABLE = new Set(["system", "daemon", "notice"]);
 const HOT = new Set(["status", "host_seen"]), HOT_PERSIST_MS = 5 * 60_000;
 const CODE_TTL = 10 * 60_000, CODE_TRIES = 5, RESEND_MS = 60_000, SENDS_PER_HOUR = 10, SEEN_EVERY = 3600_000;
+// Wrong code guesses are capped per UTC day across every code (authcode.ts: 31^8 codes), so guessing can't add up over
+// weeks. Past the cap nobody can verify until 00:00 UTC — a lockout, not a way in.
+const FAILS_PER_DAY = 20;
+// Owner sessions (app, browser, MCP access tokens) die after this long unused.
+const SESSION_IDLE_MS = 30 * 86_400_000;
+const TOTP_MISSING = "还没有绑定两步验证（验证器 App），任何人都无法登录：先在你的主机上运行 noop 2fa setup";
 
 const hex = (b: ArrayBuffer | Uint8Array) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 const sha256 = async (s: string) => hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
@@ -74,11 +85,6 @@ function sameStr(a: string, b: string) { // constant-time for equal lengths
   let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return d === 0;
 }
-function sixDigits() { // unbiased 000000–999999
-  const a = new Uint32Array(1);
-  do crypto.getRandomValues(a); while (a[0] >= 4_294_000_000);
-  return String(a[0] % 1_000_000).padStart(6, "0");
-}
 const normEmail = (e: unknown) => typeof e === "string" ? e.trim().toLowerCase() : "";
 const validEmail = (e: string) => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 
@@ -86,6 +92,13 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     // Moved: machines still pointing here keep working (and pick up the new [cloud] url from the shared config).
+    // IP allow-list (HUB_ALLOW_IPS): checked before anything else, static assets included
+    if (env.HUB_ALLOW_IPS?.trim()) {
+      const { nets, bad } = parseAllowList(env.HUB_ALLOW_IPS);
+      if (bad.length) console.error(`HUB_ALLOW_IPS: ignored ${bad.join(" ")}`);
+      const ip = req.headers.get("cf-connecting-ip") ?? "";
+      if (!ipAllowed(ip, nets)) return ipBlocked(req, ip);
+    }
     if (env.HUB_MOVED_TO) return fetch(new Request(env.HUB_MOVED_TO.replace(/\/$/, "") + url.pathname + url.search, req));
     const mcp = isMcpPath(url.pathname);
     if (mcp && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
@@ -94,6 +107,22 @@ export default {
     return env.HUB.get(env.HUB.idFromName("hub")).fetch(req);
   },
 };
+
+/** Turned away by HUB_ALLOW_IPS. The visitor sees its own public IP (nothing else), so the owner can add a phone's
+ *  network from the phone itself: JSON for the app and API clients, a small page for a browser. */
+function ipBlocked(req: Request, ip: string): Response {
+  const headers = { "cache-control": "no-store", "x-content-type-options": "nosniff" };
+  const msg = `这个网络的出口 IP ${ip || "未知"} 不在允许名单（HUB_ALLOW_IPS）里`;
+  if (!(req.headers.get("accept") ?? "").includes("text/html"))
+    return Response.json({ error: "ip_blocked", ip, message: msg }, { status: 403, headers });
+  const esc = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  return new Response(`<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Noop：IP 未放行</title><style>:root{color-scheme:light dark}body{margin:0;font:16px/1.6 -apple-system,system-ui,sans-serif;background:Canvas;color:CanvasText}
+main{max-width:420px;margin:18vh auto;padding:0 16px}h1{font-size:20px;margin:0 0 12px}.ip{font:600 24px/1.3 ui-monospace,Menlo,monospace;user-select:all;padding:12px 14px;border:1px solid #8884;border-radius:8px;word-break:break-all}
+p{color:GrayText;font-size:14px}</style></head><body><main><h1>这个网络还没放行</h1><div class="ip">${esc(ip || "未知")}</div>
+<p>这是你当前网络的出口 IP。要从这里使用 Noop，把它加到 Worker 的 HUB_ALLOW_IPS 里（可以写网段，如 1.2.3.0/24；手机流量常用 IPv6，地址会变，写它的 /64 网段）。</p></main></body></html>`,
+    { status: 403, headers: { ...headers, "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'" } });
+}
 
 const isMcpPath = (p: string) => p === "/mcp" || p.startsWith("/oauth/") || p.startsWith("/.well-known/oauth-") || p === "/.well-known/openid-configuration";
 
@@ -122,6 +151,8 @@ export class Hub extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, email TEXT, created INTEGER, last_seen INTEGER, ua TEXT);
       CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, session TEXT, p256dh TEXT, auth TEXT, label TEXT, created INTEGER);`);
     initFilesSchema(this.sql);
+    // scope: "owner" (app / browser) or "mcp" (an OAuth access token for a Claude / ChatGPT connector: /mcp only)
+    try { this.sql.exec("ALTER TABLE sessions ADD COLUMN scope TEXT"); } catch { /* exists */ }
     try { Object.assign(this.usage, JSON.parse(String(raw.exec("SELECT v FROM kv WHERE k = 'usage'").toArray()[0]?.v ?? "{}"))); } catch { /* fresh */ }
     // events.ref, indexed: a task's conversation is read by ref, never by scanning every event's JSON (rows_read is billed per row)
     try { this.sql.exec("ALTER TABLE events ADD COLUMN ref TEXT"); } catch { /* exists */ }
@@ -139,7 +170,7 @@ export class Hub extends DurableObject<Env> {
       enqueue: (op) => this.toInbox({ type: "op", op }),
       hostOnline: () => this.hostOnline(),
       startCode: async (email) => { const r = await this.auth("/api/auth/start", new Request("https://hub/api/auth/start", { method: "POST", body: JSON.stringify({ email }) })); return { status: r.status, body: await r.json() }; },
-      checkCode: (email, code) => this.checkCode(email, code),
+      checkCode: (email, code, totp, ctx) => this.checkCode(email, code, totp, ctx),
       newSession: (email, ua) => this.newSession(email, ua),
       dropSession: async (raw) => { this.sql.exec("DELETE FROM sessions WHERE id = ?", await sha256(raw)); },
     });
@@ -147,23 +178,81 @@ export class Hub extends DurableObject<Env> {
 
   statusView() { return { ...(this.get("status") ?? {}), hub: { online: this.hostOnline(), seen: this.get("host_seen") } }; }
 
-  /** Email-code check shared by /api/auth/verify and the OAuth sign-in page. */
-  async checkCode(rawEmail: unknown, rawCode: unknown): Promise<{ email?: string; error?: string; status?: number }> {
-    const email = normEmail(rawEmail), code = typeof rawCode === "string" ? rawCode.trim() : "";
-    if (!validEmail(email) || !/^\d{6}$/.test(code)) return { error: "invalid request", status: 400 };
+  /** Sign-in check shared by /api/auth/verify and the OAuth sign-in page: the emailed code AND the authenticator's
+   *  TOTP (mandatory; bound only from a machine with `noop 2fa setup`). A success is a new sign-in: the owners are told
+   *  by email (and in the feed), so a sign-in they didn't make is noticed at once. */
+  async checkCode(rawEmail: unknown, rawCode: unknown, rawTotp: unknown, ctx?: { req: Request; via: string }): Promise<{ email?: string; error?: string; status?: number }> {
+    const email = normEmail(rawEmail), code = normCode(rawCode), totp = typeof rawTotp === "string" ? rawTotp.replace(/\s/g, "") : "";
+    const tf = this.totp();
+    if (!tf) return { error: TOTP_MISSING, status: 403 };
+    if (!validEmail(email) || !CODE_RE.test(code) || !/^\d{6}$/.test(totp)) return { error: "请填写邮箱验证码和两步验证码", status: 400 };
     const r = this.sql.exec("SELECT hash, expires, attempts FROM auth_codes WHERE email = ?", email).toArray()[0];
     if (!r || (r.expires as number) < Date.now()) return { error: "验证码无效或已过期，请重新获取", status: 401 };
     if ((r.attempts as number) >= CODE_TRIES) return { error: "尝试次数太多，请重新获取验证码", status: 401 };
+    const day = new Date().toISOString().slice(0, 10), fails = this.get("auth_fails");
+    const failed = fails?.day === day ? Number(fails.n) || 0 : 0;
+    if (failed >= FAILS_PER_DAY) return { error: "今天验证失败次数太多，已锁定到 UTC 0 点", status: 429 };
     this.sql.exec("UPDATE auth_codes SET attempts = attempts + 1 WHERE email = ?", email);
-    if (!sameStr(await sha256(`${email}:${code}`), r.hash as string)) return { error: "验证码不对", status: 401 };
+    const fail = (error: string) => {
+      this.set("auth_fails", { day, n: failed + 1 });
+      if (failed + 1 >= FAILS_PER_DAY) {
+        this.sql.exec("DELETE FROM auth_codes");
+        this.alert("登录已锁定", [`今天验证已经错了 ${FAILS_PER_DAY} 次，到 UTC 0 点前任何人都无法登录。`, ...(ctx ? this.origin(ctx.req) : []),
+          "", "如果不是你本人在试：有人在猜你的验证码。已有的登录不受影响。"]);
+      }
+      return { error, status: 401 };
+    };
+    if (!sameStr(await sha256(`${email}:${code}`), r.hash as string)) return fail("邮箱验证码不对");
+    // the email code was right: a wrong TOTP keeps it (within its CODE_TRIES), so the owner can retype just the TOTP
+    const step = await totpMatch(tf.secret, totp, tf.last ?? -1);
+    if (step === null) {
+      if (ctx) this.alert("两步验证码错误", [`有人输对了 ${email} 的邮箱验证码，但两步验证码不对。`, ...this.origin(ctx.req),
+        "", "如果不是你本人：你的邮箱可能已经被盗，请立即修改邮箱密码。"]);
+      return fail("两步验证码不对（或已用过），请看验证器 App 上的最新数字");
+    }
+    this.set("totp", { ...tf, last: step }); // each code works once
     this.sql.exec("DELETE FROM auth_codes WHERE email = ?", email);
     this.sql.exec("DELETE FROM kv WHERE k = 'cli_code'");
+    if (ctx) this.alert("新登录", [`账号：${email}`, `方式：${ctx.via}`, ...this.origin(ctx.req),
+      "", "如果是你本人，无需处理。",
+      "如果不是你：在你的主机上运行 noop revoke-sessions，立即踢掉所有登录（手机、浏览器、MCP 连接器），再检查这个邮箱是否被盗。"]);
     return { email };
   }
+  /** The bound authenticator, or null (then nobody can sign in). */
+  totp(): { secret: string; last?: number; bound?: number } | null { const t = this.get("totp"); return t?.secret ? t : null; }
   async newSession(email: string, ua: string) {
+    if (!this.ownerOk(email)) throw new Error("not an owner");
     const session = hex(crypto.getRandomValues(new Uint8Array(32))), now = Date.now();
-    this.sql.exec("INSERT INTO sessions (id, email, created, last_seen, ua) VALUES (?, ?, ?, ?, ?)", await sha256(session), email, now, now, ua.slice(0, 300));
+    this.sql.exec("INSERT INTO sessions (id, email, created, last_seen, ua, scope) VALUES (?, ?, ?, ?, ?, ?)",
+      await sha256(session), email, now, now, ua.slice(0, 300), ua.startsWith("mcp:") ? "mcp" : "owner");
     return session;
+  }
+
+  // ---- security alerts
+  /** How to send mail, or null when email isn't set up (codes then go through `noop login`). */
+  mailer(): ((to: string, subject: string, text: string) => Promise<void>) | null {
+    let smtp: SmtpCfg | null = null;
+    try { smtp = this.env.HUB_SMTP ? JSON.parse(this.env.HUB_SMTP) : null; } catch {}
+    if (smtp?.host) return (to, subject, text) => sendMail(smtp!, to, subject, text);
+    if (this.env.EMAIL && this.env.HUB_MAIL_FROM) return (to, subject, text) => cfMail(this.env.EMAIL!, this.env.HUB_MAIL_FROM!, to, subject, text);
+    return null;
+  }
+  /** Where a request came from, for an alert: time, IP and place (Cloudflare's view), device. */
+  origin(req: Request): string[] {
+    const cf = (req as Request & { cf?: Record<string, unknown> }).cf ?? {};
+    const place = [cf.country, cf.region, cf.city].filter(Boolean).join(" ");
+    return [`时间：${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}（北京时间）`,
+      `IP：${req.headers.get("cf-connecting-ip") ?? "未知"}${place ? `（${place}）` : ""}${cf.asOrganization ? ` · ${cf.asOrganization}` : ""}`,
+      `设备：${(req.headers.get("user-agent") ?? "未知").slice(0, 200)}`];
+  }
+  /** A security event: mailed to every HUB_OWNER_EMAIL address and put in the feed. Never blocks or fails the request. */
+  alert(title: string, lines: string[]) {
+    this.append({ from: "hub", kind: "notice", text: `🔐 ${title}\n${lines.filter(Boolean).join("\n")}` });
+    const send = this.mailer();
+    if (!send) return;
+    const text = `Noop 安全提醒：${title}\n\n${lines.join("\n")}\n`;
+    this.ctx.waitUntil(Promise.all(this.owners().map((to) => send(to, `Noop 安全提醒：${title}`, text)
+      .catch((err) => console.error(`alert mail to ${to}: ${err}`)))));
   }
 
   // ---- free-plan budget. Past the daily allowance every DO operation of that kind errors until 00:00 UTC, so the Hub
@@ -426,7 +515,7 @@ export class Hub extends DurableObject<Env> {
     return { sent, removed, total: rows.length };
   }
 
-  async push(p: string, req: Request, who: "machine" | { session: string }): Promise<Response> {
+  async push(p: string, req: Request, who: "machine" | { session: string; scope: string }): Promise<Response> {
     if (p === "/api/push/vapid") { const v = this.vapid(); return v ? json({ publicKey: v.publicKey }) : json({ error: "push not configured" }, 503); }
     if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
     const b = (await req.json().catch(() => ({}))) as any;
@@ -480,17 +569,28 @@ export class Hub extends DurableObject<Env> {
     const h = req.headers.get("authorization") ?? "";
     return h.startsWith("Bearer ") ? h.slice(7).trim() : url.searchParams.get("token") ?? ""; // WebSocket / <img> can't send headers
   }
-  /** "machine" for HUB_TOKEN, the session id for an owner session, null otherwise. */
-  async who(req: Request, url: URL): Promise<"machine" | { session: string } | null> {
+  /** The owner allow-list (HUB_OWNER_EMAIL). Empty only before email is set up, when codes are shown by `noop login`. */
+  owners() { return (this.env.HUB_OWNER_EMAIL ?? "").split(",").map(normEmail).filter(Boolean); }
+  ownerOk(email: unknown) { const o = this.owners(); return !o.length || o.includes(normEmail(email)); }
+  /** "machine" for HUB_TOKEN, the session for an owner session, null otherwise. A session whose email left the
+   *  allow-list, or that went unused for SESSION_IDLE_MS, is deleted on sight. */
+  async who(req: Request, url: URL): Promise<"machine" | { session: string; scope: "owner" | "mcp" } | null> {
     const t = this.credential(req, url);
     if (!t) return null;
     if (sameStr(t, this.env.HUB_TOKEN)) return "machine";
     if (!/^[0-9a-f]{64}$/.test(t)) return null;
     const id = await sha256(t); // store only hashes of session ids
-    const r = this.sql.exec("SELECT last_seen FROM sessions WHERE id = ?", id).toArray()[0];
+    const r = this.sql.exec("SELECT last_seen, email, ua, scope FROM sessions WHERE id = ?", id).toArray()[0];
     if (!r) return null;
-    if (Date.now() - (r.last_seen as number) > SEEN_EVERY) this.sql.exec("UPDATE sessions SET last_seen = ? WHERE id = ?", Date.now(), id);
-    return { session: id };
+    const now = Date.now();
+    if (!this.ownerOk(r.email) || now - (r.last_seen as number) > SESSION_IDLE_MS) {
+      this.sql.exec("DELETE FROM sessions WHERE id = ?", id);
+      this.sql.exec("DELETE FROM push_subs WHERE session = ?", id);
+      return null;
+    }
+    if (now - (r.last_seen as number) > SEEN_EVERY) this.sql.exec("UPDATE sessions SET last_seen = ? WHERE id = ?", now, id);
+    const scope = r.scope === "mcp" || (r.scope == null && String(r.ua ?? "").startsWith("mcp:")) ? "mcp" : "owner";
+    return { session: id, scope };
   }
 
   async auth(p: string, req: Request): Promise<Response> {
@@ -500,14 +600,12 @@ export class Hub extends DurableObject<Env> {
     if (p === "/api/auth/start") {
       const email = normEmail(body?.email);
       if (!validEmail(email)) return json({ error: "invalid email" }, 400);
-      const owners = (this.env.HUB_OWNER_EMAIL ?? "").split(",").map(normEmail).filter(Boolean);
+      const owners = this.owners();
       // Only the allow-list may sign in: anyone else is told so at once, with no code, no mail and no row written.
       if (owners.length && !owners.includes(email)) return json({ error: "这个邮箱不允许登录" }, 403);
-      let smtp: SmtpCfg | null = null;
-      try { smtp = this.env.HUB_SMTP ? JSON.parse(this.env.HUB_SMTP) : null; } catch {}
+      if (!this.totp()) return json({ error: "totp_not_setup", message: TOTP_MISSING }, 403); // no mail for a sign-in that can't finish
       // No email set up yet: the code is shown on the owner's own machine instead (`noop login`, needs the machine key).
-      const cf = !smtp?.host && !!this.env.EMAIL && !!this.env.HUB_MAIL_FROM;
-      const cli = !smtp?.host && !cf;
+      const send = this.mailer(), cli = !send;
       this.sql.exec("DELETE FROM auth_sends WHERE ts < ?", now - 3600_000);
             const recent = this.sql.exec("SELECT COUNT(*) AS n FROM auth_sends WHERE email = ? AND ts > ?", email, now - RESEND_MS).one().n as number;
       if (recent) return json({ error: "请稍等一分钟再重新获取验证码" }, 429);
@@ -516,14 +614,13 @@ export class Hub extends DurableObject<Env> {
       const isOwner = owners.includes(email) || (cli && !owners.length);
       this.sql.exec("INSERT INTO auth_sends (email, ts, sent) VALUES (?, ?, ?)", email, now, isOwner ? 1 : 0);
       if (!isOwner) return json({ error: "这个邮箱不允许登录" }, 403); // no allow-list and email set up: nobody is the owner
-      const code = sixDigits();
+      const code = newCode();
       this.sql.exec("INSERT OR REPLACE INTO auth_codes (email, hash, expires, attempts) VALUES (?, ?, ?, 0)", email, await sha256(`${email}:${code}`), now + CODE_TTL);
       if (cli) { this.set("cli_code", { email, code, expires: now + CODE_TTL }); return json({ ok: true, delivery: "cli" }); }
       try {
         const subject = `Noop 登录验证码：${code}`;
         const text = `你的 Noop 登录验证码是：\n\n    ${code}\n\n10 分钟内有效。\n\n如果不是你本人操作，请忽略这封邮件。\n`;
-        if (cf) await cfMail(this.env.EMAIL!, this.env.HUB_MAIL_FROM!, email, subject, text);
-        else await sendMail(smtp!, email, subject, text);
+        await send!(email, subject, text);
       } catch (err) {
         console.error(`auth mail failed: ${err}`);
         this.sql.exec("DELETE FROM auth_codes WHERE email = ?", email);
@@ -532,7 +629,7 @@ export class Hub extends DurableObject<Env> {
       return json({ ok: true });
     }
     if (p === "/api/auth/verify") {
-      const r = await this.checkCode(body?.email, body?.code);
+      const r = await this.checkCode(body?.email, body?.code, (body as { totp?: unknown } | null)?.totp, { req, via: "App / 浏览器登录" });
       if (!r.email) return json({ error: r.error }, r.status ?? 401);
       return json({ session: await this.newSession(r.email, req.headers.get("user-agent") ?? "") });
     }
@@ -563,6 +660,9 @@ export class Hub extends DurableObject<Env> {
     // the single-card page: no session → the SPA's login flow (same ?ref= target pushes already use)
     if (p.startsWith("/card/") && m === "GET") return this.cardPage(req, p, url);
     const who = await this.who(req, url);
+    const who = await this.who(req, url);
+    // a connector's OAuth token is for /mcp only: never the owner API (settings, machine key via /api/host/join, …)
+    if (who && who !== "machine" && who.scope === "mcp") return json({ error: "forbidden" }, 403);
     // ntfy banner buttons hold the answer-only token (HUB_ANSWER_TOKEN): the bypass below admits it to exactly ONE
     // route, POST /api/answer — it may record card answers, nothing else. Scope it to the path, or a null who
     // would pass every "owner unless machine" route below, up to /api/host/join which hands out HUB_TOKEN. (The
@@ -619,6 +719,36 @@ export class Hub extends DurableObject<Env> {
       }
       if (r) return r;
     }
+    // Two-factor binding, from a machine only (the machine key is the root of trust; a stolen mailbox can't bind):
+    //   GET /api/host/2fa → {bound, since} · POST /api/host/2fa/setup → {secret, uri} (pending)
+    //   POST /api/host/2fa/confirm {totp} → binds the pending secret once a code from the app matches it
+    if (p.startsWith("/api/host/2fa")) {
+      if (who !== "machine") return json({ error: "forbidden" }, 403);
+      const host = req.headers.get("x-noop-host") ?? "持有机器密钥的主机";
+      if (p === "/api/host/2fa" && m === "GET") { // also what `noop security` can't see from config.toml: the live allow-list
+        const t = this.totp(), allow = parseAllowList(this.env.HUB_ALLOW_IPS);
+        return json({ bound: !!t, since: t?.bound ?? null, allow_ips: this.env.HUB_ALLOW_IPS?.trim() ? allow.nets.length : null });
+      }
+      if (p === "/api/host/2fa/setup" && m === "POST") {
+        const secret = newSecret();
+        this.set("totp_pending", { secret, expires: Date.now() + 10 * 60_000 });
+        return json({ secret, uri: otpauthUri(secret, this.owners()[0] ?? "owner") });
+      }
+      if (p === "/api/host/2fa/confirm" && m === "POST") {
+        const { totp } = (await req.json().catch(() => ({}))) as { totp?: unknown };
+        const pend = this.get("totp_pending");
+        if (!pend?.secret || pend.expires < Date.now()) return json({ error: "没有待确认的绑定（10 分钟内有效），重新运行 noop 2fa setup" }, 400);
+        const step = await totpMatch(pend.secret, totp);
+        if (step === null) return json({ error: "两步验证码不对：确认手机时间准确，输入验证器 App 上的最新数字" }, 400);
+        const was = !!this.totp();
+        this.set("totp", { secret: pend.secret, last: step, bound: Date.now() });
+        this.sql.exec("DELETE FROM kv WHERE k = 'totp_pending'"); this.mem.delete("totp_pending");
+        this.alert(was ? "两步验证已换绑" : "两步验证已开启", [`操作方：${host}`, `时间：${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}（北京时间）`,
+          "", was ? "旧的验证器从现在起失效。如果不是你本人操作：有人拿到了你的机器密钥，立即检查你的主机。" : "从现在起，登录需要邮箱验证码 + 验证器 App 上的两步验证码。"]);
+        return json({ ok: true, replaced: was });
+      }
+      return json({ error: "not found" }, 404);
+    }
     if (p === "/api/host/login-code") { // `noop login` on the owner's machine, when email isn't configured
       if (who !== "machine") return json({ error: "forbidden" }, 403);
       const c = this.get("cli_code");
@@ -636,6 +766,11 @@ export class Hub extends DurableObject<Env> {
       const n = this.sql.exec("SELECT COUNT(*) AS n FROM sessions").one().n;
       this.sql.exec("DELETE FROM sessions");
       this.sql.exec("DELETE FROM push_subs");
+      // connectors too: a refresh token would otherwise mint a fresh session right back
+      this.sql.exec("DELETE FROM oauth_refresh");
+      this.sql.exec("DELETE FROM oauth_codes");
+      this.sql.exec("DELETE FROM auth_codes");
+      this.alert("所有登录已撤销", [`${n} 个登录（手机、浏览器、MCP 连接器）已被踢下线，需要重新用邮箱验证码登录。`, `操作方：${req.headers.get("x-noop-host") ?? "持有机器密钥的主机"}`]);
       return json({ ok: true, revoked: n });
     }
     // Moving the hub to another Cloudflare account, one page at a time (media blobs are large):
@@ -731,6 +866,14 @@ export class Hub extends DurableObject<Env> {
       this.toInbox({ type: "cancel", id, done: done === true });
       return json({ ok: true });
     }
+    if (p === "/api/channels" && m === "GET") return json(channelsView(this.mcp.store()));
+    if (p === "/api/channels" && m === "POST") { // owner: edit a channel's goal / archive it; the primary writes the file
+      if (who === "machine") return json({ error: "forbidden" }, 403);
+      const { slug, goal, archived } = (await req.json().catch(() => ({}))) as { slug?: string; goal?: unknown; archived?: unknown };
+      if (!slug || !CHANNEL_SLUG.test(slug)) return json({ error: "slug required" }, 400);
+      this.toInbox({ type: "channel", slug, ...(typeof goal === "string" ? { goal: goal.slice(0, 500) } : {}), ...(typeof archived === "boolean" ? { archived } : {}) });
+      return json({ ok: true });
+    }
     if (p === "/api/fleet/update" && m === "POST") { // owner: every machine updates to the latest code; the primary acts on it
       if (who === "machine") return json({ error: "forbidden" }, 403);
       this.toInbox({ type: "update" });
@@ -762,7 +905,7 @@ export class Hub extends DurableObject<Env> {
       const rows = this.sql.exec("SELECT type, data FROM media WHERE id = ? ORDER BY n", id).toArray();
       if (!rows.length) return json({ error: "not found" }, 404);
       const parts = rows.map((r) => new Uint8Array(r.data as ArrayBuffer));
-      return new Response(new Blob(parts), { headers: { "content-type": rows[0].type as string, "cache-control": "private, max-age=31536000" } });
+      return new Response(new Blob(parts), { headers: mediaHeaders(rows[0].type as string, id) });
     }
 
     // ---- fleet side
@@ -826,3 +969,4 @@ export class Hub extends DurableObject<Env> {
     this.settle(0);
   }
 }
+

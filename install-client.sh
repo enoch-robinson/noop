@@ -56,4 +56,13 @@ else
     printf "\nThe app needs GTK 4.14 or later and glibc 2.39 or later (Ubuntu 24.04 or newer). Missing:\n%s\n" "$MISSING"
     echo "On Debian or Ubuntu: sudo apt install libgtk-4-1"
   fi
+  # Videos play through GStreamer: MP4 needs qtdemux (plugins-good), H.264 needs
+  # libav, and hub URLs need souphttpsrc. Without them the player shows an error.
+  if command -v pacman > /dev/null; then
+    GST="$(for p in gst-plugins-good gst-libav; do pacman -Q "$p" > /dev/null 2>&1 || echo "$p"; done)"
+    [ -z "$GST" ] || { echo "Installing GStreamer plug-ins for video playback: $GST"; sudo pacman -S --needed --noconfirm $GST || echo "Install them to play videos: sudo pacman -S $GST"; }
+  elif command -v apt-get > /dev/null; then
+    GST="$(for p in gstreamer1.0-plugins-good gstreamer1.0-libav; do dpkg -s "$p" > /dev/null 2>&1 || echo "$p"; done)"
+    [ -z "$GST" ] || { echo "Installing GStreamer plug-ins for video playback: $GST"; sudo apt-get install -y $GST || echo "Install them to play videos: sudo apt install $GST"; }
+  fi
 fi

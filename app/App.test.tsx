@@ -558,6 +558,39 @@ describe("channel", () => {
     await app.waitFor("早就做完了");
   });
 
+  test("channels: the sidebar lists them with unread counts; a channel shows its goal, items, edit and archive", async () => {
+    const posts: unknown[] = [];
+    const fresh = ts(5);
+    const chans = [
+      { slug: "omamail", name: "Omamail", goal: "omamail 的 PR 与 issue", status: "active", created: ts(-900), last_activity: fresh, stale: false, count: 2,
+        items: [{ id: "T-0700", kind: "task", title: "omamail #460 审查", state: "done", updated: fresh }, { id: "D-0700", kind: "decision", title: "合并 omamail #460 吗？", state: "closed", updated: ts(30), task: "T-0700" }] },
+      { slug: "omasend", name: "Omasend", goal: "omasend", status: "active", created: ts(-20000), last_activity: ts(-20000), stale: true, count: 0, items: [] },
+    ];
+    const app = await open("./App.tsx", {
+      storage: { ...STORAGE, "noop.channels.since": ts(-10000) }, width: 1200, height: 800, platform: "macos",
+      network: {
+        ...hub([]),
+        [`GET ${URL}/api/channels`]: { body: { channels: chans } },
+        [`POST ${URL}/api/channels`]: (r: { body?: string | null }) => { posts.push(JSON.parse(r.body!)); return { body: { ok: true } }; },
+      },
+    });
+    await app.waitFor("id:side-channel-omamail");
+    await app.waitFor("id:side-channel-unread-omamail");
+    await app.waitFor("Quiet 7d");
+    await app.press("id:side-channel-omamail");
+    await app.waitFor("omamail 的 PR 与 issue");
+    await app.waitFor("omamail #460 审查");
+    await app.waitFor("合并 omamail #460 吗？");
+    await app.waitUntil(() => !app.shows("id:side-channel-unread-omamail"));
+    await app.press("id:channel-edit-goal");
+    await app.type("id:channel-goal-input", "，以及发布");
+    await app.press("id:channel-save-goal");
+    await app.waitFor("omamail 的 PR 与 issue，以及发布");
+    await app.press("id:channel-archive");
+    await app.waitFor("id:channel-archived");
+    expect(posts).toEqual([{ slug: "omamail", goal: "omamail 的 PR 与 issue，以及发布" }, { slug: "omamail", archived: true }]);
+  });
+
   test("a dropped connection stays quiet until reconnecting keeps failing", async () => {
     const app = await open("./App.tsx", { storage: STORAGE, network: hub([]) });
     await app.waitFor("id:composer");

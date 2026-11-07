@@ -5,6 +5,7 @@ import { homedir, hostname } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import * as sync from "./sync";
 import { CLIS } from "./clis";
+import { BUILTIN_ROUTINES } from "./builtin-routines";
 
 /** Framework code (this repo, self-updating). */
 export const CODE = resolve(import.meta.dir, "..");
@@ -38,6 +39,13 @@ export function loadConfig(): Cfg {
   // settings.json = changes made from the UI (shared via the data repo), applied over config.toml; config.local.toml wins last
   const ui = existsSync(P("settings.json")) ? JSON.parse(readFileSync(P("settings.json"), "utf8")) : {};
   const cfg: Cfg = merge(merge(merge(sync.readHubToml(), read("config.toml")), ui), read("config.local.toml"));
+  // built-in routines (src/builtin-routines.ts) unless config.toml defines one of the same name
+  cfg.routine = Array.isArray(cfg.routine) ? cfg.routine : [];
+  for (const b of BUILTIN_ROUTINES) if (!cfg.routine.some((r: any) => r.name === b.name)) {
+    const r: Record<string, unknown> = { ...b, builtin: true };
+    if (r.agent && !existsSync(P("agents", String(r.agent)))) r.agent = "lead"; // a fleet without that member
+    cfg.routine.push(r);
+  }
   // routine tweaks from the UI: { routines: { <name>: { enabled, every } } }
   for (const r of cfg.routine ?? []) Object.assign(r, ui.routines?.[r.name] ?? {});
   cfg.notify ??= {};

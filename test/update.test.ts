@@ -149,3 +149,14 @@ test("release numbers compare by part", () => {
   expect(compareVersions("0.2.1", "0.2.1")).toBe(0);
   expect(compareVersions("0.2", "0.2.1")).toBeLessThan(0);
 });
+
+test("shell line: version, build and NSH; a phone shell without packages says to reinstall", async () => {
+  const { shellLine } = await import("../app/update");
+  const info = { version: "0.2.1", build: 35, nshVersion: "0.4.0", packages: true };
+  expect(shellLine(info, "ios")).toEqual({ text: "0.2.1 (35) · NSH 0.4.0", tone: "ok" });
+  expect(shellLine({ ...info, version: null, build: null, packages: false }, "linux")).toEqual({ text: "dev · NSH 0.4.0", tone: "ok" });
+  // a runtime without shellInfo says nothing either way
+  expect(shellLine(undefined, "ios")).toBeNull();
+  expect(shellLine(undefined, "macos")).toBeNull();
+  expect(shellLine({ ...info, packages: false }, "android")).toEqual({ text: "no-packages", tone: "bad" });
+});

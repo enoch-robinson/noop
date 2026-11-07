@@ -2,6 +2,18 @@
 
 Technical reference for people and AI agents working on this codebase.
 
+## Third-party pull requests
+
+Noop accepts third-party pull requests only for:
+
+- Bug fixes.
+- Security fixes.
+- Performance optimizations.
+
+Noop was not intended to accept third-party pull requests that shape the product. Changes to product design, scheduling behavior, workflows, or product details are not accepted. New features and other changes outside the three categories above will be declined.
+
+Keep fixes focused on the existing behavior. A bug fix, security fix, or performance optimization must not bundle unrelated product or workflow changes.
+
 ## Principles
 
 - Single owner. Noop serves one person (the CEO); there is no multi-tenant or shared service. Each user deploys their own Cloudflare Worker.

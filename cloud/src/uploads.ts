@@ -41,3 +41,17 @@ export function ownerAttachments(v: unknown): string[] | null {
   if (!Array.isArray(v) || v.length > MAX_ATTACHMENTS) return null;
   return v.every((x) => typeof x === "string" && /^\/media\/[\w][\w.\-]*$/.test(x) && !x.includes("..")) ? (v as string[]) : null;
 }
+
+/** Media is served from the app's own origin: anything a browser could run as a page (HTML, SVG, XML, JS…) is sent as a
+ *  download, never rendered, and every response is sandboxed — an uploaded file must not be able to read the session. */
+export function mediaHeaders(type: string, name: string): Record<string, string> {
+  const t = String(type || "application/octet-stream").toLowerCase();
+  const inline = /^(image\/(png|jpe?g|gif|webp|avif|heic|heif|bmp)|video\/[\w.+-]+|audio\/[\w.+-]+|application\/pdf|text\/plain)(;|$)/.test(t);
+  return {
+    "content-type": inline ? t : "application/octet-stream",
+    "content-disposition": `${inline ? "inline" : "attachment"}; filename="${name.replace(/[^\w.\-]/g, "_")}"`,
+    "x-content-type-options": "nosniff",
+    "content-security-policy": "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'",
+    "cache-control": "private, max-age=31536000",
+  };
+}

@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { P, list, readDoc, writeDoc } from "../src/core";
 import { sweepPlatform, alreadyAsked, cardFor, checkUnrunnable, classify, groupByCause, supervise, type Ctx, type Task } from "../src/supervisor";
 import { closeDecision, ignoreDecision } from "../src/decisions";
@@ -13,6 +13,13 @@ const ctx = (o: Partial<Ctx> = {}): Ctx => ({ now: NOW, online: [mac, lin, old],
   maxAgeHours: 3, maxWakes: 3, decision: () => undefined, ...o });
 const task = (m: Record<string, string>, folder: "waiting" | "blocked" = "waiting"): Task =>
   ({ folder, meta: { title: m.id, created: new Date(NOW - H).toISOString(), waiting_on: "x", wait_check: "true", ...m } });
+
+// Every test file shares one throwaway hub (see test/preload.ts), and reroute/resume move tasks into
+// tasks/inbox with their host requirement stripped. A leftover there is a pickable task, so a later
+// file's pickTask() test would pick it up instead of its own fixture. Remove what this file created.
+afterAll(() => {
+  for (const id of ["T-0101", "T-0102", "T-0103", "T-0201", "T-0202"]) rmSync(P("tasks", "inbox", `${id}.md`), { force: true });
+});
 
 test("young, normally cycling waits are left alone", () => {
   expect(classify(task({ id: "T-1", requires: "os:linux", wakes: "1" }), ctx())).toBeNull();
