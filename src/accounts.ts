@@ -86,8 +86,10 @@ export function classify(output: string): Failure {
   return null;
 }
 
-/** Try to read the reset time from messages like "resets at 3pm", "try again in 2h 13m". */
-function resetTime(output: string): Date {
+/** Try to read the reset time from an explicit `retryAfterMs`, "try again in 2h 13m", or "resets at 3pm". */
+export function resetTime(output: string): Date {
+  const ms = output.match(/retryAfterMs\D{0,4}(\d{3,})/i);
+  if (ms) return new Date(Date.now() + (+ms[1] + 60_000)); // the provider's own retry hint, plus a minute of slack
   const m = output.match(/\bin\s+(?=\d)(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?/i);
   if (m && (m[1] || m[2])) return new Date(Date.now() + ((+m[1] || 0) * 60 + (+m[2] || 0) + 2) * 60_000);
   const at = output.match(/(?:resets?|again) at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);

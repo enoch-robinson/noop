@@ -145,7 +145,7 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   void proc.exited.then(() => { if (tid && agentProcs.get(tid) === proc) agentProcs.delete(tid); });
 
   // what the agent is doing: every chunk of output is a sign of life; stream adapters also name each step
-  const ev: RunEvents = { step: undefined, steps: 0, assistantText: "", resultText: undefined, inFlight: new Map() };
+  const ev: RunEvents = { step: undefined, steps: 0, assistantText: "", resultText: undefined, error: undefined, inFlight: new Map() };
   // a stream adapter's output is parsed for steps and the report; anything else is returned as-is.
   // Claude's stream-json shape is the fallback parser for unknown CLI names and codex (no parseEvent);
   // a registered adapter's parseEvent always wins, even when a config command override emits another shape.
@@ -164,6 +164,15 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
     // adapters without such events keep the startModel estimate
     if (e.type === "system" && e.subtype === "init" && e.model) act.model = String(e.model);
     if (e.type === "assistant" && e.message?.model && !e.parent_tool_use_id) act.model = String(e.message.model);
+    // a provider error (429 quota, 401 auth, …) ends the run without a result block: remember the first one so the
+    // caller's classify → failover/cooldown reacts instead of reporting a vague "no result block"
+    if (e.type === "error" && !ev.error) {
+      const er = e.error ?? e.part ?? e;
+      const msg = typeof er?.message === "string" ? er.message : typeof er?.error?.message === "string" ? er.error.message : undefined;
+      const bits = [er?.type && er.type !== "error" ? String(er.type) : undefined, er?.status ? `HTTP ${er.status}` : undefined,
+        msg, Number.isFinite(er?.retryAfterMs) ? `(retryAfterMs ${er.retryAfterMs})` : undefined].filter(Boolean);
+      if (bits.length) ev.error = bits.join(" ");
+    }
     parse(e, ev);
   };
   const read = async (stream: ReadableStream<Uint8Array>, lines: boolean) => {
@@ -199,7 +208,9 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   if (tid) agentActivity.delete(tid);
   mkdirSync(P("logs", "runs"), { recursive: true });
   writeFileSync(logFile, `$ ${cmd.join(" ")}\n(exit ${code})\n\n${raw}\n\n[stderr]\n${err}`);
-  const out = json ? (ev.resultText ?? ev.assistantText) : raw;
+  let out = json ? (ev.resultText ?? ev.assistantText) : raw;
+  // quota/auth walls never yield a result block: surface the provider's own words so classify() sees them
+  if (ev.error) out += `${out.trim() ? "\n" : ""}[provider-error] ${ev.error}`;
   if (timedOut) return `${out}${STALLED} hit the ${Math.round(timeoutMs / 60_000)}-minute run limit (clis.timeout_minutes)${ev.step ? `; last step: ${ev.step}` : ""}; run long builds in the background and return "waiting"`;
   if (stalled) return `${out}${STALLED} no output for ${Math.round(stallMs / 60_000)} minutes${ev.step ? `; last step: ${ev.step}` : ""}`;
   // A provider occasionally answers with an empty completion (no text, no tool call, exit 0) and Claude Code's own

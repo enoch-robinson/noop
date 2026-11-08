@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { due } from "../src/cli";
-import { matches, signature, type Cfg } from "../src/core";
+import { classify, failoverAccount, pickAccount, reportFailure, resetTime } from "../src/accounts";
+import { matches, signature, P, type Cfg } from "../src/core";
 import { parseResult, runAgent } from "../src/runner";
 
 test("routine schedule", () => {
@@ -221,6 +222,37 @@ test("a reply to an agent's message goes to the brain with that task, never as a
   await handleOwnerMessage("等等，选 B");
   expect(calls.at(-1)).toEqual(["等等，选 B", { reply: undefined, answered: "D-0001" }]);
   expect(drainInbound()).toEqual([{ id: "D-0001", answer: "A", source: "chat" }]);
+});
+
+test("a provider error event (429 free-limit) surfaces as [provider-error] and classifies as quota", async () => {
+  // opencode's real failure shape (logs/runs/T-0019/T-0054): one error event, no result block, exit 1. runAgent must
+  // surface the provider's own words so classify → failover/cooldown fires instead of "no result block".
+  const lines = [
+    { type: "step_start", part: { id: "prt_1", type: "step-start" } },
+    { type: "error", error: { type: "provider.free-limit", status: 429, retryAfterMs: 55643000,
+      message: "Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models." } },
+  ].map((l) => JSON.stringify(l)).join("\n");
+  const cfg = { clis: { fake: { command: ["sh", "-c", 'printf "%s\\n" "$1"; exit 1', "stream-json", lines] } } } as unknown as Cfg;
+  const log = `${tmpdir()}/noop-run-${process.pid}-429.log`;
+  const out = await runAgent("fake", "", tmpdir(), cfg, log);
+  rmSync(log, { force: true });
+  expect(out).toContain("[provider-error] provider.free-limit HTTP 429 Free usage limit reached.");
+  expect(out).toContain("(retryAfterMs 55643000)");
+  expect(classify(out)).toBe("quota");
+  const until = resetTime(out);
+  expect(until.getTime() - Date.now()).toBeGreaterThan(15 * 3600_000); // 55643000ms ≈ 15.45h, not the default 1h guess
+  expect(parseResult(out).status).toBe("failed"); // still no result block — the caller now knows why
+});
+
+test("a 429 cooldown pushes account picking to the next CLI", async () => {
+  const cfg = {} as Cfg;
+  mkdirSync(P("journal"), { recursive: true }); // reportFailure journals the cooldown into the sandboxed hub
+  const failed = { cli: "opencode", name: "default", dir: "" };
+  await reportFailure(failed, "quota",
+    "[provider-error] provider.free-limit HTTP 429 Free usage limit reached. (retryAfterMs 55643000)", cfg);
+  expect(pickAccount(cfg, ["opencode", "pi", "omp"])?.cli).toBe("pi"); // opencode-default is cooling down
+  const installed = (c: string) => ["opencode", "pi", "omp"].includes(c); // failoverAccount's DI predicate
+  expect(failoverAccount(cfg, failed, ["opencode", "pi", "omp"], installed)?.cli).toBe("pi");
 });
 
 test("a result block survives a later turn from a background task notification", async () => {

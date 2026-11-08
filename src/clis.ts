@@ -16,6 +16,7 @@ export type RunEvents = {
   steps: number;                   // tool calls so far
   assistantText: string;           // accumulated assistant text (the report, when there is no final-result event)
   resultText: string | undefined;  // explicit final result (Claude result events)
+  error?: string;                  // provider error event (HTTP 429 quota, 401 auth, …) — runAgent appends it as [provider-error]
   inFlight: Map<string, string>;   // in-flight tool call id → name; dedupes tool updates, spots Claude subagents
 };
 
