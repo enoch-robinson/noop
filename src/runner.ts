@@ -1,6 +1,7 @@
 // Builds the prompt for an agent, runs Claude Code / Codex headless, parses the structured result.
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   type Cfg, P, ROOT, agentActivity, agentName, precedents, readAll, readIf, recentJournal, signature,
 } from "./core";
@@ -111,6 +112,15 @@ export function cliCommand(cli: string, cfg: Cfg, gateOverride = false): string[
   return runCommand(cli, cfg, ctx);
 }
 
+/** The model a CLI is started with: an explicit `--model`/`-m`, else Codex's own config default. */
+export function startModel(cli: string, cmd: string[], codexHome?: string): string | undefined {
+  codexHome ??= process.env.CODEX_HOME ?? join(homedir(), ".codex");
+  const i = cmd.findIndex((c) => c === "--model" || c === "-m");
+  if (i >= 0 && cmd[i + 1]) return cmd[i + 1];
+  if (cli === "codex") return readIf(join(codexHome, "config.toml"), 100000).match(/^\s*model\s*=\s*"([^"]+)"/m)?.[1];
+  return undefined;
+}
+
 /** Running agent processes by task id (so the owner can cancel one). */
 export const agentProcs = new Map<string, { kill: (sig?: number | NodeJS.Signals) => void }>();
 
@@ -141,15 +151,19 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   // a registered adapter's parseEvent always wins, even when a config command override emits another shape.
   const json = cmd.includes("stream-json") || (!!adapter?.parseEvent && !adapter.streamJson);
   const parse = adapter?.parseEvent ?? parseStreamJson;
-  const act = { at: Date.now() };
+  const act = { at: Date.now(), model: startModel(cli, cmd, extraEnv.CODEX_HOME) };
   const touch = () => {
     act.at = Date.now();
-    if (tid) agentActivity.set(tid, { at: new Date(act.at).toISOString(), step: ev.step, steps: ev.steps });
+    if (tid) agentActivity.set(tid, { at: new Date(act.at).toISOString(), step: ev.step, steps: ev.steps, model: act.model });
   };
   touch();
   const onLine = (line: string) => {
     let e: any;
     try { e = JSON.parse(line); } catch { return; }
+    // model display (#94): generic capture ahead of the adapter parse — Claude's init/assistant events carry it;
+    // adapters without such events keep the startModel estimate
+    if (e.type === "system" && e.subtype === "init" && e.model) act.model = String(e.model);
+    if (e.type === "assistant" && e.message?.model && !e.parent_tool_use_id) act.model = String(e.message.model);
     parse(e, ev);
   };
   const read = async (stream: ReadableStream<Uint8Array>, lines: boolean) => {

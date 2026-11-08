@@ -34,7 +34,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.nsh-dist
-        key: nsh-dist-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ inputs.ref }}${{ steps.apple-sdk.outputs.key }}${{ inputs.target == 'macos' && format('-{0}', inputs.rust-target || 'native') || '' }}
+        key: nsh-dist-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ inputs.ref }}${{ steps.apple-sdk.outputs.key }}${{ inputs.target == 'macos' && format('-{0}', inputs.rust-target || 'native') || '' }}${{ inputs.target == 'linux' && '-crypto-v1' || '' }}
 
     # The x86_64 CLI also generates x86_64 OTA archive names. It needs Rosetta even on cache hits.
     - if: runner.os == 'macOS' && runner.arch == 'ARM64' && inputs.rust-target == 'x86_64-apple-darwin'
@@ -55,7 +55,40 @@ runs:
         fi
         test -f "$ANDROID_HOME/platforms/android-35/android.jar"
 
-    - if: steps.cache.outputs.cache-hit != 'true'
+    # Use the prebuilt NSH nightly when it is exactly the pinned commit: it has the CLI and every runtime in the
+    # release layout, so packaging skips the Rust build. Intel macOS and iOS (the nightly has no iOS runtime) build from source; the
+    # Linux runtime is still built here because noop's is built without WebKitGTK.
+    - id: nightly
+      if: steps.cache.outputs.cache-hit != 'true' && inputs.rust-target == '' && inputs.target != 'ios'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REF: ${{ inputs.ref }}
+      run: |
+        commit="$(gh release view nightly -R longbridge/nsh --json targetCommitish -q .targetCommitish || true)"
+        if [ "$commit" != "$REF" ]; then
+          echo "NSH nightly is $commit, not $REF: building from source"
+          exit 0
+        fi
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) asset=nsh-linux-x86_64.tar.gz ;;
+          macOS-ARM64) asset=nsh-macos-arm64.tar.gz ;;
+          Windows-X64) asset=nsh-windows-x86_64.zip ;;
+          *) echo "No NSH nightly for $RUNNER_OS-$RUNNER_ARCH: building from source"; exit 0 ;;
+        esac
+        tmp="$RUNNER_TEMP/nsh-nightly"
+        rm -rf "$tmp" && mkdir -p "$tmp"
+        gh release download nightly -R longbridge/nsh -p "$asset" -p "$asset.sha256" -D "$tmp"
+        (cd "$tmp" && sha256sum -c "$asset.sha256" 2>/dev/null || shasum -a 256 -c "$asset.sha256")
+        case "$asset" in
+          *.zip) unzip -q "$tmp/$asset" -d "$tmp/x" ;;
+          *) mkdir -p "$tmp/x" && tar xzf "$tmp/$asset" -C "$tmp/x" ;;
+        esac
+        rm -rf "$HOME/.nsh-dist" && mkdir -p "$HOME/.nsh-dist"
+        cp -R "$tmp/x/nsh/bin" "$tmp/x/nsh/runtime" "$HOME/.nsh-dist/"
+        echo "used=true" >> "$GITHUB_OUTPUT"
+
+    - if: steps.cache.outputs.cache-hit != 'true' && (steps.nightly.outputs.used != 'true' || inputs.target == 'linux')
       uses: actions/checkout@v4
       with:
         repository: longbridge/nsh
@@ -63,21 +96,21 @@ runs:
         path: .nsh-src
         # Keep the native build's host tools when cross-compiling Intel on the same Mac runner.
         clean: ${{ inputs.target != 'macos' || inputs.rust-target == '' }}
-    - if: steps.cache.outputs.cache-hit != 'true'
+    - if: steps.cache.outputs.cache-hit != 'true' && (steps.nightly.outputs.used != 'true' || inputs.target == 'linux')
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ inputs.rust-target }}
 
     # Linux runtime libraries are needed even when the built NSH distribution is cached.
-    - if: runner.os == 'Linux' && (steps.cache.outputs.cache-hit != 'true' || inputs.target == 'linux')
+    - if: runner.os == 'Linux' && ((steps.cache.outputs.cache-hit != 'true' && steps.nightly.outputs.used != 'true') || inputs.target == 'linux')
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
       run: |
         sudo apt-get update
         sudo apt-get install -y clang llvm libclang-dev pkg-config
-        [ "$TARGET" != linux ] || sudo apt-get install -y libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-    - if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        [ "$TARGET" != linux ] || sudo apt-get install -y libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev xvfb xauth
+    - if: steps.cache.outputs.cache-hit != 'true' && (steps.nightly.outputs.used != 'true' || inputs.target == 'linux') && runner.os == 'Windows'
       shell: bash
       run: |
         # QuickJS is C: bindgen needs libclang, which the image's LLVM has.
@@ -85,12 +118,13 @@ runs:
         # rustc can overflow its default stack on the `windows` crate.
         echo "RUST_MIN_STACK=268435456" >> "$GITHUB_ENV"
 
-    - if: steps.cache.outputs.cache-hit != 'true'
+    - if: steps.cache.outputs.cache-hit != 'true' && (steps.nightly.outputs.used != 'true' || inputs.target == 'linux')
       shell: bash
       working-directory: .nsh-src
       env:
         TARGET: ${{ inputs.target }}
         RUST_TARGET: ${{ inputs.rust-target }}
+        NIGHTLY: ${{ steps.nightly.outputs.used }}
       run: |
         out="$HOME/.nsh-dist"
         exe=""; [ "$RUNNER_OS" != Windows ] || exe=.exe
@@ -101,14 +135,17 @@ runs:
           target_args=(--target "$RUST_TARGET")
           release_dir="target/$RUST_TARGET/release"
         fi
-        cargo build --release --locked -p nsh-cli "${target_args[@]}"
-        install -d "$out/bin"
-        cp "$release_dir/nsh$exe" "$out/bin/"
+        if [ "$NIGHTLY" != true ]; then
+          cargo build --release --locked -p nsh-cli "${target_args[@]}"
+          install -d "$out/bin"
+          cp "$release_dir/nsh$exe" "$out/bin/"
+        fi
         case "$TARGET" in
           linux)
             # noop shows no web views, so the app needs only GTK 4 and not WebKitGTK.
-            cargo build --release --locked -p nsh-linux-app --no-default-features --features js
-            install -d "$out/runtime/linux"; cp target/release/nsh-linux-app "$out/runtime/linux/" ;;
+            # Sending uses crypto.randomUUID() for optimistic message IDs. `js` alone omits Web Crypto.
+            cargo build --release --locked -p nsh-linux-app --no-default-features --features js,crypto
+            rm -rf "$out/runtime/linux"; install -d "$out/runtime/linux"; cp target/release/nsh-linux-app "$out/runtime/linux/" ;;
           windows)
             cargo build --release --locked -p nsh-windows-app
             install -d "$out/runtime/windows"; cp target/release/nsh-windows-app.exe "$out/runtime/windows/" ;;
@@ -148,6 +185,13 @@ runs:
     - if: inputs.target == 'ios'
       shell: bash
       run: bash "$GITHUB_WORKSPACE/scripts/check-ios-sdk.sh" "$HOME/.nsh-dist/runtime/ios/iphoneos/nsh-ios-app"
+
+    # Test the actual release runner, including cache hits: development hosts enable all standard modules.
+    - if: inputs.target == 'linux'
+      shell: bash
+      run: |
+        TMPDIR="$RUNNER_TEMP" NSH="$HOME/.nsh-dist/bin/nsh" \
+          bash "$GITHUB_WORKSPACE/scripts/check-linux-runtime.sh" "$HOME/.nsh-dist/runtime/linux/nsh-linux-app"
 
     - shell: bash
       run: |

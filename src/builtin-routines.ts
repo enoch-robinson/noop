@@ -25,4 +25,14 @@ const SECURITY_ROUTINE = {
 4. Result summary for the owner: one verdict line (e.g. "本机安全：2 个高风险") plus the high-risk items and the report path. If anything is high risk, use needs_decision with options to fix now (as a gated follow-up) or accept; otherwise done.`,
 };
 
-export const BUILTIN_ROUTINES: Record<string, unknown>[] = [SECURITY_ROUTINE];
+/** Weekly usage report: computed from the hub files by code (src/usage-report.ts, no AI run), saved under
+ *  reports/usage/ and posted to the main chat so everyone using this Noop can follow how it is used. */
+const USAGE_ROUTINE = {
+  name: "usage-report",
+  kind: "usage-report",
+  every: "weekly MON 09:00",
+  scheduler: "primary",
+  desc: "每周一汇总上周的使用情况（任务、PR、Agent 时长、决策、额度），和前一周对比，发到主会话",
+};
+
+export const BUILTIN_ROUTINES: Record<string, unknown>[] = [SECURITY_ROUTINE, USAGE_ROUTINE];

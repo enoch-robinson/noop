@@ -214,6 +214,8 @@ export type BrainIn = {
   chat?: string[];
   /** When the owner sent it (feed ts), for latency. */
   sentAt?: string;
+  /** Said inside a channel: the discussion and the work it starts stay there. */
+  channel?: { slug: string; name: string; goal: string };
 };
 export type BrainOut = { reply: string; calls: { tool: string; args: any; ok: boolean; result?: any; error?: string }[]; rounds: number; ms: { first_reply?: number; model: number[]; total: number }; fallback?: boolean };
 
@@ -241,6 +243,7 @@ export function context(st: ToolStore, m: BrainIn): string {
     mem.length ? `Memory lines that may be relevant (read_memory for more):\n${mem.join("\n")}` : "",
     ids.length ? `Tasks mentioned in the channel: ${ids.join(", ")}` : "",
     `The channel just before (oldest first):\n${(m.chat ?? []).join("\n") || "(empty)"}`,
+    m.channel ? `The owner wrote this inside the channel #${m.channel.name} (\`${m.channel.slug}\`), goal: ${m.channel.goal || "(none)"}. Read it in that context; the conversation above is this channel's. Your reply and any task you create belong to this channel (it is added to the task's channels automatically).` : "",
     m.replyTo ? `The owner wrote this as a reply to the team's message about ${m.replyTo}.` : "",
     `The owner's message:\n${m.text.slice(0, 4000)}`,
   ].filter(Boolean).join("\n\n");

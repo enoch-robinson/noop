@@ -99,7 +99,7 @@ export function startCloudBridge(cfg: Cfg) {
       after = it.seq; saveCursor(); // before handling, so a restart mid-message doesn't replay it
       if (!fresh) return;
       appendEvent(e, { mirror: false }); // keep the local record (learning reads it); the cloud already has it
-      await handleOwnerMessage(e.text, e.ref, false, { paths: e.attachments, key: e.id, fetch: (p) => cloudMedia(cfg, p), sentAt: e.ts, thread: e.thread, via: typeof e.via === "string" ? e.via : undefined });
+      await handleOwnerMessage(e.text, e.ref, false, { paths: e.attachments, key: e.id, fetch: (p) => cloudMedia(cfg, p), sentAt: e.ts, thread: e.thread, via: typeof e.via === "string" ? e.via : undefined, channel: e.channel });
     } else if (it.type === "op" && it.op) {
       await applyOp(it.op);
     } else if (it.type === "cancel" && typeof it.id === "string") {

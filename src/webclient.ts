@@ -4,7 +4,7 @@ import { $ } from "bun";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 
-const ASSET = "Noop-web.tar.gz";
+const ASSET = "noop-web.tar.gz";
 const WEB_DIR = join(import.meta.dir, "..", "app", "dist", "web");
 const LATEST = "https://github.com/huacnlee/noop/releases/latest/download";
 
@@ -15,7 +15,7 @@ const fetched = async (url: string, seconds: number) => {
 };
 
 /**
- * Brings the web client up to the latest release's, verified against its SHA256SUMS. A client built locally
+ * Brings the web client up to the latest release's, verified against its sha256sums. A client built locally
  * (one with no record of a release) stays. Returns whether a client is in place: a failed download keeps the
  * one there, so this never throws or leaves less than it found.
  */
@@ -26,7 +26,7 @@ export async function ensureWebClient(dir = WEB_DIR, base = process.env.NOOP_CLI
   if (present() && !existsSync(record)) return true;
   const work = join(dir, `.download-${process.pid}`);
   try {
-    const sums = await (await fetched(`${base}/SHA256SUMS`, 15)).text();
+    const sums = await (await fetched(`${base}/sha256sums`, 15)).text();
     const expected = sums.split("\n").map((l) => l.trim().split(/\s+\*?/)).find(([, name]) => name === ASSET)?.[0];
     if (!expected) throw new Error(`${ASSET} is not in the release`);
     if (present() && readFileSync(record, "utf8").trim() === expected) return true;

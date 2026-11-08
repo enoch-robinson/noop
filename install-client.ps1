@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"  # the progress bar slows downloads down a lot
 
 $Base = if ($env:NOOP_CLIENT_BASE_URL) { $env:NOOP_CLIENT_BASE_URL } else { "https://github.com/huacnlee/noop/releases/latest/download" }
-$Asset = "Noop-windows-x86_64.zip"
+$Asset = "noop-windows-x86_64.zip"
 $Dir = Join-Path $env:LOCALAPPDATA "Programs\Noop"
 $Work = Join-Path ([IO.Path]::GetTempPath()) ("noop-" + [IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $Work | Out-Null
@@ -14,8 +14,8 @@ try {
   Write-Host "Downloading $Asset"
   $Zip = Join-Path $Work $Asset
   Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Asset" -OutFile $Zip
-  $Sums = Join-Path $Work "SHA256SUMS"
-  Invoke-WebRequest -UseBasicParsing -Uri "$Base/SHA256SUMS" -OutFile $Sums
+  $Sums = Join-Path $Work "sha256sums"
+  Invoke-WebRequest -UseBasicParsing -Uri "$Base/sha256sums" -OutFile $Sums
   $Line = Get-Content $Sums | Where-Object { ($_ -split "\s+")[1] -replace "^\*", "" -eq $Asset } | Select-Object -First 1
   if (-not $Line -or ($Line -split "\s+")[0] -ne (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash) { throw "the checksum of $Asset does not match" }
 

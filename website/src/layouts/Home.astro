@@ -20,7 +20,7 @@ const panels = [
   { id: 'client', label: t.client, note: t.clientNote, rows: [
     { label: 'macOS / Linux', script: 'install-client.sh', command: `curl -fsSL ${site}/install-client.sh | bash` },
     { label: 'Windows', script: 'install-client.ps1', command: `irm ${site}/install-client.ps1 | iex` },
-  ], downloads: [{ label: t.android, href: `${latest}/Noop-android.apk` }, { label: t.ios, href: `${latest}/Noop-ios-unsigned.ipa` }] },
+  ], downloads: [{ label: t.android, href: `${latest}/noop-android.apk` }, { label: t.ios, href: `${latest}/noop-ios-unsigned.ipa` }] },
 ];
 const relatedProjects = [
   { name: 'Disktree', href: 'https://huacnlee.github.io/disktree/', description: t.relatedDescriptions.disktree },

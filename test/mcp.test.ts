@@ -375,3 +375,22 @@ test("task history: every task in pages, newest first, and any one of them on it
   expect(taskInfo(st, "T-0204")).toMatchObject({ state: "done", request: "fix it", runs: [{ status: "done", summary: "fixed" }] });
   expect(taskInfo(st, "T-9999")).toBeNull();
 });
+
+test("task listings patch changed rows instead of re-reading the directory", () => {
+  const { sql, mcp, file } = hub();
+  for (let i = 0; i < 50; i++) file(`tasks/done/T-1${String(i).padStart(3, "0")}.md`, `---\nid: T-1${i}\ntitle: t${i}\n---\n`);
+  const queries: string[] = [];
+  const exec = sql.exec.bind(sql);
+  sql.exec = (q: string, ...b: any[]) => { queries.push(q); return exec(q, ...b); };
+  const store = mcp.store();
+  expect(store.list("tasks/").length).toBe(52);
+  queries.length = 0;
+  file("tasks/active/T-0184.md", "---\nid: T-0184\ntitle: renamed\n---\n");
+  sql.exec("DELETE FROM files WHERE path = 'tasks/done/T-0100.md'"); file("tasks/done/T-0100.md", "");
+  sql.exec("UPDATE files SET deleted = 1 WHERE path = 'tasks/done/T-0100.md'");
+  const rows = store.list("tasks/");
+  expect(queries.some((q) => q.includes("path >= ?"))).toBe(false); // no full directory read
+  expect(rows.length).toBe(51);
+  expect(rows.find((r) => r.path === "tasks/active/T-0184.md")?.text).toContain("renamed");
+  expect(rows.map((r) => r.path)).toEqual([...rows.map((r) => r.path)].sort().reverse());
+});

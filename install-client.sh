@@ -14,10 +14,10 @@ case "$(uname -s)" in
     # A shell under Rosetta reports x86_64 on an Apple silicon Mac, so ask the hardware.
     [ "$(sysctl -n hw.optional.arm64 2> /dev/null || true)" = 1 ] || fail "the macOS client needs Apple silicon"
     [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 14 ] || fail "the macOS client needs macOS 14 or later"
-    ASSET=Noop-macos-arm64.zip ;;
+    ASSET=noop-macos-arm64.zip ;;
   Linux)
     [ "$(uname -m)" = x86_64 ] || fail "the Linux client needs x86_64"
-    ASSET=Noop-linux-x86_64.tar.gz ;;
+    ASSET=noop-linux-x86_64.tar.gz ;;
   *) fail "use install-client.ps1 on Windows" ;;
 esac
 
@@ -25,8 +25,10 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 echo "Downloading $ASSET"
 curl -fsSL "$BASE/$ASSET" -o "$WORK/$ASSET"
-curl -fsSL "$BASE/SHA256SUMS" -o "$WORK/SHA256SUMS"
-EXPECTED="$(awk -v asset="$ASSET" '$2 == asset || $2 == "*" asset { print $1 }' "$WORK/SHA256SUMS")"
+curl -fsSL "$BASE/sha256sums" -o "$WORK/sha256sums"
+# GitHub serves release downloads case-insensitively, and the manifest may spell the name either way
+# (the 2026-11 lowercase rename shipped before a release carried the new names): match case-insensitively.
+EXPECTED="$(awk -v asset="$ASSET" 'tolower($2) == tolower(asset) || tolower($2) == "*" tolower(asset) { print $1 }' "$WORK/sha256sums")"
 [ -n "$EXPECTED" ] && [ "$EXPECTED" = "$(sha256 "$WORK/$ASSET")" ] || fail "the checksum of $ASSET does not match"
 
 if [ "$(uname -s)" = Darwin ]; then

@@ -53,8 +53,8 @@ irm https://huacnlee.github.io/noop/install-client.ps1 | iex
 
 From v0.1.5 the desktop apps update themselves: when a new version has downloaded, the sidebar offers a restart. Earlier versions update by running the same command again.
 
-- **Android** (9+): download [Noop-android.apk](https://github.com/huacnlee/noop/releases/latest/download/Noop-android.apk) on your phone and open it.
-- **iOS** (15+): [Noop-ios-unsigned.ipa](https://github.com/huacnlee/noop/releases/latest/download/Noop-ios-unsigned.ipa) is not signed, so sign and install it with your own Apple ID using a tool such as Sideloadly or AltStore.
+- **Android** (9+): download [noop-android.apk](https://github.com/huacnlee/noop/releases/latest/download/noop-android.apk) on your phone and open it.
+- **iOS** (15+): [noop-ios-unsigned.ipa](https://github.com/huacnlee/noop/releases/latest/download/noop-ios-unsigned.ipa) is not signed, so sign and install it with your own Apple ID using a tool such as Sideloadly or AltStore.
 
 ## Use
 

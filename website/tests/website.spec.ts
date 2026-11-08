@@ -119,8 +119,8 @@ test('tabs switch with mouse and keyboard and copy the chosen command', async ({
   await page.getByRole('tab', { name: 'More machines', exact: true }).focus();
   await page.keyboard.press('End');
   await expect(client).toBeFocused();
-  await expect(page.getByRole('tabpanel').getByRole('link', { name: /Android/ })).toHaveAttribute('href', 'https://github.com/huacnlee/noop/releases/latest/download/Noop-android.apk');
-  await expect(page.getByRole('tabpanel').getByRole('link', { name: /iOS/ })).toHaveAttribute('href', 'https://github.com/huacnlee/noop/releases/latest/download/Noop-ios-unsigned.ipa');
+  await expect(page.getByRole('tabpanel').getByRole('link', { name: /Android/ })).toHaveAttribute('href', 'https://github.com/huacnlee/noop/releases/latest/download/noop-android.apk');
+  await expect(page.getByRole('tabpanel').getByRole('link', { name: /iOS/ })).toHaveAttribute('href', 'https://github.com/huacnlee/noop/releases/latest/download/noop-ios-unsigned.ipa');
   await page.locator('[data-copy="command-client-0"]').click();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(`curl -fsSL ${site}/install-client.sh | bash`);
   await page.keyboard.press('Tab');

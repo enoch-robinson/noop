@@ -24,8 +24,8 @@ concurrency:
 
 env:
   # NSH main with OTA updates through signed packages (longbridge/nsh#1189), the Android bindgen fix for NDK 27, and
-  # checkForUpdate leaving the whole app alone while a package of its release runs (longbridge/nsh#1207), the Linux tray painting an SVG icon as a template (longbridge/nsh#1209), and shellInfo() for the installed app's version and NSH runtime (longbridge/nsh#1226).
-  NSH_REF: a45c403e08d59453a259943deb77acbd96dcdbe9
+  # checkForUpdate leaving the whole app alone while a package of its release runs (longbridge/nsh#1207), the Linux tray painting an SVG icon as a template (longbridge/nsh#1209), and shellInfo() for the installed app's version and NSH runtime (longbridge/nsh#1226). Also the Linux updater restarting from the pre-swap program path (longbridge/nsh#1269).
+  NSH_REF: c4c4bf5cec60886b3308034a51eef9c3fbb58c50
 
 defaults:
   run:
@@ -38,12 +38,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: linux, os: ubuntu-24.04, asset: Noop-linux-x86_64.tar.gz, installer: install-client.sh }
-          - { target: windows, os: windows-latest, asset: Noop-windows-x86_64.zip, installer: install-client.ps1 }
-          - { target: macos, os: macos-15, asset: Noop-macos-arm64.zip, installer: install-client.sh }
-          - { target: ios, os: xcode-27, asset: Noop-ios-unsigned.ipa }
-          - { target: android, os: ubuntu-24.04, asset: Noop-android.apk }
-          - { target: web, os: ubuntu-24.04, asset: Noop-web.tar.gz }
+          - { target: linux, os: ubuntu-24.04, asset: noop-linux-x86_64.tar.gz, installer: install-client.sh }
+          - { target: windows, os: windows-latest, asset: noop-windows-x86_64.zip, installer: install-client.ps1 }
+          - { target: macos, os: macos-15, asset: noop-macos-arm64.zip, installer: install-client.sh }
+          - { target: ios, os: xcode-27, asset: noop-ios-unsigned.ipa }
+          - { target: android, os: ubuntu-24.04, asset: noop-android.apk }
+          - { target: web, os: ubuntu-24.04, asset: noop-web.tar.gz }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -115,7 +115,7 @@ jobs:
           ASSET: ${{ matrix.asset }}
           INSTALLER: ${{ matrix.installer }}
         run: |
-          (cd assets && { command -v sha256sum > /dev/null && sha256sum "$ASSET" || shasum -a 256 "$ASSET"; } > SHA256SUMS)
+          (cd assets && { command -v sha256sum > /dev/null && sha256sum "$ASSET" || shasum -a 256 "$ASSET"; } > sha256sums)
           python=python3; command -v python3 > /dev/null || python=python
           (cd assets && exec "$python" -m http.server 8765 > /dev/null 2>&1) &
           server=$!
@@ -135,7 +135,7 @@ jobs:
               test -x "$HOME/.local/bin/noop-client"
               grep -q "^Exec=$HOME/.local/share/noop-client/Noop" "$HOME/.local/share/applications/dev.noop.app.desktop" ;;
           esac
-          rm assets/SHA256SUMS
+          rm assets/sha256sums
 
       # Reuse this ARM runner for Intel after packaging and testing the native app.
       # The installer currently supports only Apple silicon; Intel users download the archive.
@@ -156,10 +156,10 @@ jobs:
           mkdir -p assets-intel
           # The Intel CLI runs through Rosetta and also names OTA archives macos-x86_64.
           (cd app && nsh package --target macos -o "$out" "${args[@]}")
-          ditto -c -k --keepParent "$out/Noop.app" assets-intel/Noop-macos-x86_64.zip
+          ditto -c -k --keepParent "$out/Noop.app" assets-intel/noop-macos-x86_64.zip
           mv "$out"/Noop-*-macos-x86_64.tar.gz assets-intel/
           app="$RUNNER_TEMP/verify-x86_64/Noop.app"
-          ditto -x -k assets-intel/Noop-macos-x86_64.zip "$RUNNER_TEMP/verify-x86_64"
+          ditto -x -k assets-intel/noop-macos-x86_64.zip "$RUNNER_TEMP/verify-x86_64"
           executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
           lipo "$app/Contents/MacOS/$executable" -verify_arch x86_64
           codesign --verify --deep --strict "$app"
@@ -168,7 +168,7 @@ jobs:
         if: matrix.target == 'macos'
         uses: actions/upload-artifact@v4
         with:
-          name: Noop-macos-x86_64.zip
+          name: noop-macos-x86_64.zip
           path: assets-intel/
           if-no-files-found: error
 
@@ -194,6 +194,12 @@ jobs:
         with:
           path: assets
           merge-multiple: true
+      # Release file names are lowercase on every project (nsh names its OTA archives after the app, Noop-<version>-...).
+      - name: Lowercase asset names
+        run: |
+          cd assets
+          for f in *; do l=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]'); [ "$f" = "$l" ] || mv "$f" "$l"; done
+          ls -l
       # OTA: the app's code as a package signed with the release key (certified by the root whose public key is in
       # app/nsh.json). Installed apps on every platform, iOS and Android included, run it from their next launch when
       # its build is newer than theirs and their NSH runtime is new enough; otherwise they take the whole app below.
@@ -209,7 +215,7 @@ jobs:
           (umask 077 && mkdir -p "$keys" && printf '%s\n' "$NSH_PACKAGE_KEY" > "$keys/release.secret")
           printf '%s\n' "$NSH_PACKAGE_CERT" > "$keys/release.cert"
           (cd app && nsh publish App.tsx --key "$keys/release.secret" --cert "$keys/release.cert" \
-            --build "$GITHUB_RUN_NUMBER" --app-version "$version" -o "$GITHUB_WORKSPACE/assets/Noop-$version.nshpkg")
+            --build "$GITHUB_RUN_NUMBER" --app-version "$version" -o "$GITHUB_WORKSPACE/assets/noop-$version.nshpkg")
           rm -rf "$keys"
       # The apps fetch `releases/latest/download/latest.json`, the versioned archives and the package next to it
       # (nsh/updater). The installers keep using the unversioned assets. An APK cannot replace itself: Android gets a
@@ -219,17 +225,17 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           jq --arg version "$version" '.version = $version' app/nsh.json > "$RUNNER_TEMP/nsh.json"
           mv "$RUNNER_TEMP/nsh.json" app/nsh.json
-          nsh update-manifest assets/Noop-"$version"-*.tar.gz assets/Noop-"$version"-*.zip --entry app --out assets \
-            --package assets/Noop-"$version".nshpkg \
-            --link "android=https://github.com/$GITHUB_REPOSITORY/releases/latest/download/Noop-android.apk"
+          nsh update-manifest assets/noop-"$version"-*.tar.gz assets/noop-"$version"-*.zip --entry app --out assets \
+            --package assets/noop-"$version".nshpkg \
+            --link "android=https://github.com/$GITHUB_REPOSITORY/releases/latest/download/noop-android.apk"
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           cd assets
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
+          sha256sum * > sha256sums
+          cat sha256sums
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" * --clobber
           else

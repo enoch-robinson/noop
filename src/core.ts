@@ -242,7 +242,8 @@ export type HostBeat = { host: string; caps: string[]; seen: string; busy: numbe
   /** Per running task: when its agent last showed a sign of life and what it was doing. */ activity?: Record<string, Activity> };
 
 /** A running agent's latest sign of life: any output; for Claude also the step it took ("Bash · gh pr checks 814"). */
-export type Activity = { at: string; step?: string; steps: number };
+export type Activity = { at: string; step?: string; steps: number;
+  /** The model actually answering (Claude reports it in its stream; Codex: the one it was started with). */ model?: string };
 /** This process's running agents (written by runAgent, published in the heartbeat). */
 export const agentActivity = new Map<string, Activity>();
 

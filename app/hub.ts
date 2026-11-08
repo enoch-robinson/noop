@@ -8,6 +8,7 @@ export type CardChoice = { key: string; label: string; consequence?: string; rec
 
 export type HubEvent = {
   id: string;
+  client_id?: string;
   ts: string;
   from: string;
   kind: Kind;
@@ -16,6 +17,8 @@ export type HubEvent = {
   priority?: string;
   /** Said inside a task's own conversation: on the task page, not in the main channel. */
   thread?: boolean;
+  /** Said in a channel (its slug): shown there only, never in the main chat. */
+  channel?: string;
   options?: string[];
   choices?: CardChoice[];
   /** A resolved event: how the card ended (answered / ignored / overridden / snoozed / superseded) and by whom. */
@@ -33,7 +36,7 @@ export type HostInfo = {
   os?: string;
   arch?: string;
   clis?: string[];
-  accounts?: { cli: string; name: string; state: "ok" | "cooldown" | "login"; until?: string }[];
+  accounts?: { cli: string; name: string; state: "ok" | "cooldown" | "login"; until?: string; model?: string }[];
   running?: { id: string; title: string; agent: string; started?: string; activity?: Activity }[];
   recent?: { id: string; title: string; state?: string; finished?: string }[];
   /** The code the machine runs: its git commit, and that commit on GitHub. */
@@ -44,7 +47,7 @@ export type HostInfo = {
 };
 
 /** A running agent's latest sign of life, and (Claude) the step it took. */
-export type Activity = { at: string; step?: string; steps?: number };
+export type Activity = { at: string; step?: string; steps?: number; model?: string };
 
 /** "最近：Bash · gh pr checks 814 · 2 分钟前"; quiet for 10+ minutes reads as such (the fleet stops it at 20 and runs it again). */
 export function activityLine(a: Activity | undefined, now = Date.now()): { text: string; quiet: boolean } | null {

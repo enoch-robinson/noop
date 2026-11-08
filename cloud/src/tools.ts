@@ -492,3 +492,11 @@ export function channelsView(st: ToolStore, nowMs = Date.now(), limit = 100) {
     return { ...c, last_activity: last, stale, count: list.length, refs: list.filter((i) => i.kind !== "report").map((i) => i.id), items: list.slice(0, limit) };
   }) };
 }
+
+/** A channel's digest: the main-chat messages about its tasks and cards (results, decisions, the owner's words), newest
+ *  last. Task-thread chatter and the hub's own acks are execution detail, so they stay on the task page. */
+export function channelDigest<E extends { ref?: string; from: string; thread?: boolean; kind?: string; channel?: string }>(events: readonly E[], refs: readonly string[], slug?: string, limit = 80): E[] {
+  const want = new Set(refs);
+  // what was said in the channel itself (the owner, the team's replies) plus the main chat's results and cards about its work
+  return events.filter((e) => !e.thread && (e.channel ? e.channel === slug : !!e.ref && want.has(e.ref) && !/^hub/.test(e.from) && e.kind !== "system")).slice(-limit);
+}

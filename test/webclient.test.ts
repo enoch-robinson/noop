@@ -21,8 +21,8 @@ describe("ensureWebClient", () => {
     // Run from root with relative names: tar on Windows reads an absolute "C:\..." path as a remote host.
     await $`tar -czf ${name} -C ${`src-${text}`} .`.cwd(root).quiet();
     const bytes = new Uint8Array(await Bun.file(tarball).arrayBuffer());
-    assets["Noop-web.tar.gz"] = bytes;
-    assets.SHA256SUMS = `${sum ?? new Bun.CryptoHasher("sha256").update(bytes).digest("hex")}  Noop-web.tar.gz\n`;
+    assets["noop-web.tar.gz"] = bytes;
+    assets.sha256sums = `${sum ?? new Bun.CryptoHasher("sha256").update(bytes).digest("hex")}  noop-web.tar.gz\n`;
   }
 
   beforeEach(() => {
@@ -57,7 +57,7 @@ describe("ensureWebClient", () => {
     await ensureWebClient(dir, base());
     requests.length = 0;
     expect(await ensureWebClient(dir, base())).toBe(true);
-    expect(requests).toEqual(["SHA256SUMS"]);
+    expect(requests).toEqual(["sha256sums"]);
   });
 
   test("replaces the client with a newer release's", async () => {
@@ -98,8 +98,8 @@ describe("ensureWebClient", () => {
     const tarball = join(root, "empty.tar.gz");
     await $`tar -czf empty.tar.gz -C empty .`.cwd(root).quiet();
     const bytes = new Uint8Array(await Bun.file(tarball).arrayBuffer());
-    assets["Noop-web.tar.gz"] = bytes;
-    assets.SHA256SUMS = `${new Bun.CryptoHasher("sha256").update(bytes).digest("hex")}  Noop-web.tar.gz\n`;
+    assets["noop-web.tar.gz"] = bytes;
+    assets.sha256sums = `${new Bun.CryptoHasher("sha256").update(bytes).digest("hex")}  noop-web.tar.gz\n`;
     expect(await ensureWebClient(dir, base())).toBe(true);
     expect(index()).toBe("one");
   });

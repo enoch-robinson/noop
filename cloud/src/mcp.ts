@@ -91,9 +91,20 @@ function listDir(sql: McpSql, dir: string): FileRow[] {
   if (!cache) listCache.set(sql, cache = new Map());
   const hit = cache.get(dir);
   if (hit) {
+    // patch only what changed under dir (a few rows) instead of re-reading the whole listing (up to 2000 rows) on every
+    // task update: re-reading tasks/ after each change was most of the Hub's billed rows_read
     const changed = sql.exec("SELECT path, rev FROM files WHERE rev > ? ORDER BY rev", hit.rev).toArray();
-    if (!changed.some((r) => String(r.path).startsWith(dir))) {
-      if (changed.length) hit.rev = Number(changed[changed.length - 1].rev);
+    if (changed.length) hit.rev = Number(changed[changed.length - 1].rev);
+    const mine = [...new Set(changed.map((r) => String(r.path)).filter((p) => p.startsWith(dir)))];
+    if (!mine.length) return hit.rows;
+    if (mine.length > 200) cache.delete(dir);
+    else {
+      const gone = new Set(mine), fresh: FileRow[] = [];
+      for (const p of mine) {
+        const r = readFile(sql, p);
+        if (r) fresh.push(r);
+      }
+      hit.rows = [...hit.rows.filter((r) => !gone.has(r.path)), ...fresh].sort((a, b) => (a.path < b.path ? 1 : a.path > b.path ? -1 : 0)).slice(0, 2000);
       return hit.rows;
     }
   }

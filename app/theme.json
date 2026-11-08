@@ -6,7 +6,18 @@
       "radius-card": "12px",
       "radius-control": "12px",
       "brand-fill": "#111111",
-      "on-brand": "#ffffff"
+      "on-brand": "#ffffff",
+      "avatar-1": "#c6363c",
+      "avatar-2": "#bc4b08",
+      "avatar-3": "#946800",
+      "avatar-4": "#237c52",
+      "avatar-5": "#087e73",
+      "avatar-6": "#006fc4",
+      "avatar-7": "#3451b2",
+      "avatar-8": "#7c3db5",
+      "avatar-9": "#b02c80",
+      "avatar-10": "#62625c",
+      "avatar-foreground": "#ffffff"
     },
     "light": {
       "background": "#fafafa",
