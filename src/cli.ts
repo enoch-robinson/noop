@@ -31,7 +31,7 @@ import { runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { adoptCloudUrl, readHubToml } from "./sync";
 import { judgeAccuracy, level, needsApproval, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
-import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
+import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag, which } from "./core";
 import { accountEnv, accountsStatus, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
 import { channelPrompt, channels, resolveChannels, updateChannel } from "./channels";
 
@@ -711,12 +711,14 @@ async function planNow(cfg: Cfg, host: string) {
   const todo = list(P("tasks", "inbox"), /^T-.*\.md$/).map((p) => ({ p, ...readDoc(p) })).filter((t) => !t.meta.planned).slice(0, 12);
   if (!todo.length) return;
   const hosts = onlineHosts(cfg).map((h) => `- ${h.host}: ${h.caps.join(",")}`).join("\n");
+  const installed = CLIS.filter((a) => which(a.name)); // never offer the planner a CLI this fleet can't run
+  const cliLine = (installed.length ? installed : CLIS).map((a) => `"${a.name}"${a.plannerHint ? ` ${a.plannerHint}` : ""}`).join("; ");
   const r = await quickAsk(`You place tasks for an AI agent fleet running on several machines.
 For each task decide:
 - channels: zero to three slugs from the channel goals below, or {"name":"...","goal":"..."} for a new work topic.
 - requires: host capabilities it truly needs, comma-separated, from the hosts' caps below (e.g. "os:macos" for iOS/macOS builds,
   simulators or screenshots; "os:windows"; "" when any host will do). Only require what the work cannot be done without.
-- cli: one of ${CLIS.map((a) => `"${a.name}"${a.plannerHint ? ` ${a.plannerHint}` : ""}`).join("; ")}.
+- cli: one of ${cliLine}.
 - difficulty: "hard" or "normal".
 
 ${channelPrompt()}
@@ -741,7 +743,8 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
       const planned = byName(String(v.cli ?? ""))?.name;
       // planner named an unregistered CLI: still stored as claude; the journal below logs the raw name
       if (!pinned && v.cli && !planned) journal(host, `⚠️ ${t.meta.id}: planner named unknown cli "${v.cli}", using claude`);
-      writeDoc(t.p, { ...readDoc(t.p).meta, channels: channelSlugs, requires: req, ...(pinned ? {} : { cli: planned ?? "claude" }),
+      else if (!pinned && planned && !which(planned)) journal(host, `⚠️ ${t.meta.id}: planner named uninstalled cli "${planned}", an installed CLI will run it`);
+      writeDoc(t.p, { ...readDoc(t.p).meta, channels: channelSlugs, requires: req, ...(pinned ? {} : { cli: planned ?? CLIS.map((a) => a.name).find(which) ?? "claude" }),
         ...(v.difficulty === "hard" ? { difficulty: "hard" } : {}), planned: now() }, t.body);
       journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${pinned ? t.meta.cli : v.cli}`);
     }

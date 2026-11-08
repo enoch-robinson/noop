@@ -484,7 +484,8 @@ test("every adapter builds a headless command and maps the gate list; the schedu
 
   // scheduler facts come from the registry, not hardcoded lists
   expect(allowedClis({}, {} as any)).toEqual(CLIS.map((a) => a.name));
-  expect(allowedClis({ cli: "omp" }, {} as any)).toEqual(["omp"]);
+  // a pinned CLI leads the pool but no longer monopolizes it: an uninstalled pin used to park the task forever
+  expect(allowedClis({ cli: "omp" }, {} as any)).toEqual(["omp", ...CLIS.map((a) => a.name).filter((n) => n !== "omp")]);
   expect(chooseCli({}, {} as any)).toBe(CLIS.map((a) => a.name).find((c) => Bun.which(c)) ?? null); // first installed, registry order
   const caps = hostCaps({} as any);
   for (const a of CLIS) expect(caps.includes(`cli:${a.name}`)).toBe(!!Bun.which(a.name));

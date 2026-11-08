@@ -223,12 +223,14 @@ export function newTask(title: string, body = "", o: TaskOpts = {}): string {
 export const which = (bin: string) => Bun.which(bin) !== null;
 
 /** Which CLI runs a task: the owner's per-agent config wins, else what the planner (an AI call, see planInbox) chose.
- *  Unplanned tasks may use any registered CLI, Claude first. */
+ *  A pinned CLI that isn't installed here falls through to the rest of the pool instead of parking the task in a
+ *  claim/requeue loop no host could satisfy (a planner that names claude/codex on a host without them used to queue
+ *  tasks forever). Unplanned tasks may use any registered CLI, Claude first. */
 export function allowedClis(meta: Record<string, string>, cfg: Cfg): string[] {
-  if (meta.cli && meta.cli !== "auto") return [meta.cli];
+  const pinned = meta.cli && meta.cli !== "auto" ? [meta.cli] : [];
   const per = cfg.clis?.agents?.[meta.agent || "lead"] as string[] | undefined;
-  if (per) return per;
-  return CLIS.map((a) => a.name);
+  const pool = per ?? CLIS.map((a) => a.name);
+  return [...new Set([...pinned.filter(which), ...pool])];
 }
 
 export function chooseCli(meta: Record<string, string>, cfg: Cfg): string | null {
