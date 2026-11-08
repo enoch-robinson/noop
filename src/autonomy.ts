@@ -55,6 +55,25 @@ export function supersedeProposed(name: string, newId: string, host?: string): s
   return out;
 }
 
+/** Queued copies of a routine that have waited longer than `minAgeMinutes` are never going to claim
+ *  (the host lost a capability, the CLI is gone, the claim loop stalled): retire them so the routine's
+ *  fresh copy can run instead of skipping forever (2026-11-08: uptime-watch skipped for ~16 h behind
+ *  a queued copy while every later run was swallowed). Called before the fresh copy is created. */
+export function supersedeStaleQueued(name: string, minAgeMinutes: number, host?: string): string[] {
+  const out: string[] = [];
+  for (const p of list(P("tasks", "inbox"), /^T-.*\.md$/)) {
+    const { meta, body } = readDoc(p);
+    if (!isRoutine(meta, name) || (host && meta.host !== host)) continue;
+    const ageMin = (Date.now() - (Date.parse(meta.created ?? "") || Date.now())) / 60_000;
+    if (ageMin <= minAgeMinutes) continue; // young: still hope it claims
+    writeDoc(P("tasks", "rejected", `${meta.id}.md`), { ...meta, approval: "released:stale-queued" },
+      body + `\n\n## Note\nreleased after ${Math.round(ageMin)} min queued without claiming (watchdog); a fresh copy of ${name} takes over.\n`);
+    unlinkSync(p);
+    out.push(meta.id);
+  }
+  return out;
+}
+
 /** Judge may only auto-decide outside onboarding. */
 export const judgeMayDecide = (cfg: Cfg, agent?: string) => level(cfg, agent) !== "onboarding";
 

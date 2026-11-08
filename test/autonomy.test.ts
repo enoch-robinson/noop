@@ -85,6 +85,18 @@ test("routine dedupe: a long-parked copy stops blocking, a fresh one still does"
   expect(A.routineQueued("parked")).toBe("T-0104");
 });
 
+test("watchdog release: stale queued routine copies retire, young ones and other routines stay", () => {
+  task("inbox", "T-0105", "routine:uptime-watch", ago(120)); // queued 2 h, threshold 60 min → released
+  task("inbox", "T-0106", "routine:uptime-watch", ago(5)); // young → stays
+  task("inbox", "T-0107", "routine:pr-review", ago(120)); // different routine → untouched
+  expect(A.supersedeStaleQueued("uptime-watch", 60)).toEqual(["T-0105"]);
+  expect(files("tasks", "rejected")).toEqual(["T-0105.md"]);
+  expect(files("tasks", "inbox")).toEqual(["T-0106.md", "T-0107.md"]);
+  expect(readFileSync(P("tasks", "rejected", "T-0105.md"), "utf8")).toContain("released after 120 min");
+  // below the threshold nothing is released
+  expect(A.supersedeStaleQueued("pr-review", 1440)).toEqual([]);
+});
+
 test("read-only routines skip approval at onboarding; others and followups stay gated", () => {
   expect(A.needsApproval(cfg, "routine:uptime-watch")).toBe(false);
   expect(A.needsApproval(cfg, "routine:pr-review")).toBe(true);

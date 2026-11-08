@@ -30,7 +30,7 @@ import { followUpTarget, reopenTask, type BrainOut, ClaudeModel, SYSTEM, dataAct
 import { runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { adoptCloudUrl, readHubToml } from "./sync";
-import { judgeAccuracy, level, needsApproval, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
+import { judgeAccuracy, level, needsApproval, proposeBatch, resolveProposals, routineQueued, supersedeProposed, supersedeStaleQueued } from "./autonomy";
 import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag, which } from "./core";
 import { accountEnv, accountsStatus, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
 import { channelPrompt, channels, resolveChannels, updateChannel } from "./channels";
@@ -56,6 +56,15 @@ export function due(every: string, last: string | undefined, t = new Date()): bo
   return lastT < target;
 }
 
+/** The routine's interval in minutes (hourly → 60, "10m" → 10, daily → 1440, weekly → 10080). */
+export function everyMinutes(every: string): number {
+  const p = every.trim().split(/\s+/)[0];
+  if (p === "hourly") return 60;
+  if (/^\d+m$/.test(p)) return parseInt(p);
+  if (p === "weekly") return 10_080;
+  return 1440; // daily and every other slot form
+}
+
 /** Cheap pre-check: run the routine's `signal` shell command; only an output change wakes an agent.
  * A failing command counts as changed (the agent then looks). */
 export function signalChanged(r: { name: string; signal?: string }, state: Record<string, string>): boolean {
@@ -69,50 +78,65 @@ export function signalChanged(r: { name: string; signal?: string }, state: Recor
   return true;
 }
 
-function runRoutines(cfg: Cfg, host: string, primary: boolean) {
+export function runRoutines(cfg: Cfg, host: string, primary: boolean) {
   const state: Record<string, string> = existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : {};
-  maybeProposeNext(cfg, host, state);
-  for (const r of cfg.routine ?? []) {
-    if (r.enabled === false) continue;
-    const owner = r.scheduler ?? (r.kind === "learn" ? "each" : "primary"); // which host generates the task
-    if (owner === "primary" ? !primary : owner !== "each" && owner !== host) continue;
-    if (!due(r.every, state[r.name])) continue;
-    if (r.kind === "learn") { // local session history → digest → task pinned to this host
-      state[r.name] = new Date().toISOString();
-      const d = collect(cfg);
-      if (!d.file) { journal(host, `📚 learn: no new sessions`); continue; }
-      const id = newTask(`learn the CEO · ${host} · ${d.sessions} sessions`, LEARN_PROMPT(d.file),
-        { agent: "apprentice", host, source: `routine:learn`, priority: "normal" });
-      journal(host, `📚 learn: ${d.turns} owner turns from ${d.sessions} sessions → ${id}`);
-      continue;
-    }
-    if (r.kind === "usage-report") { // computed by code, posted to the main chat; no task, no model cost
-      state[r.name] = new Date().toISOString();
+  try {
+    maybeProposeNext(cfg, host, state);
+    for (const r of cfg.routine ?? []) {
+      // one broken routine must not kill the rest, rewind every schedule (state is persisted in `finally`),
+      // or abort the tick before the task-claim loop (2026-11-08: a bad session file starved the queue overnight)
       try {
-        const rep = writeUsageReport();
-        appendEvent({ from: "hub", kind: "notice", text: rep.markdown });
-        journal(host, `📊 usage report → ${rep.file}`);
-      } catch (e) { journal(host, `📊 usage report failed: ${(e as Error).message}`); }
-      continue;
+        if (r.enabled === false) continue;
+        const owner = r.scheduler ?? (r.kind === "learn" ? "each" : "primary"); // which host generates the task
+        if (owner === "primary" ? !primary : owner !== "each" && owner !== host) continue;
+        if (!due(r.every, state[r.name])) continue;
+        if (r.kind === "learn") { // local session history → digest → task pinned to this host
+          state[r.name] = new Date().toISOString();
+          const d = collect(cfg);
+          if (!d.file) { journal(host, `📚 learn: no new sessions`); continue; }
+          const id = newTask(`learn the CEO · ${host} · ${d.sessions} sessions`, LEARN_PROMPT(d.file),
+            { agent: "apprentice", host, source: `routine:learn`, priority: "normal" });
+          journal(host, `📚 learn: ${d.turns} owner turns from ${d.sessions} sessions → ${id}`);
+          continue;
+        }
+        if (r.kind === "usage-report") { // computed by code, posted to the main chat; no task, no model cost
+          state[r.name] = new Date().toISOString();
+          try {
+            const rep = writeUsageReport();
+            appendEvent({ from: "hub", kind: "notice", text: rep.markdown });
+            journal(host, `📊 usage report → ${rep.file}`);
+          } catch (e) { journal(host, `📊 usage report failed: ${(e as Error).message}`); }
+          continue;
+        }
+        // scheduler "each": every machine runs its own copy, pinned to it (e.g. the weekly security check of this computer)
+        const pin = owner === "each" ? host : undefined;
+        const queued = routineQueued(r.name, pin); // a copy queued or running → this run is redundant
+        if (queued) {
+          // a copy stuck in the queue for a full interval (or queue_release_minutes) is never going to claim
+          // (host lost a capability, CLI gone, claim loop stalled): release the routine instead of skipping forever
+          const release = Math.max(everyMinutes(r.every), cfg.fleet?.queue_release_minutes ?? 60);
+          const freed = supersedeStaleQueued(r.name, release, pin);
+          if (!freed.length) { state[r.name] = new Date().toISOString(); journal(host, `⏰ routine \`${r.name}\` skipped: ${queued} still queued/running`); continue; }
+          journal(host, `⏰ routine \`${r.name}\`: stale queued ${freed.join(", ")} released after > ${release}m in the queue`);
+        }
+        if (r.signal && !signalChanged(r, state)) { state[r.name] = new Date().toISOString(); continue; } // nothing new → no AI run
+        if (r.agent === "architect") computeMetrics(r.name === "evolve-deep" ? 30 : 7);
+        const prompt = r.readonly ? `${r.prompt}\n\nRead-only routine: observe and report only. Do not change code, PRs, issues or settings; propose any change as a follow-up.` : r.prompt;
+        const id = newTask(`${r.name}${pin ? ` · ${pin}` : ""} · ${new Date().toLocaleString("sv-SE").slice(0, 16)}`, prompt, {
+          agent: r.agent, cli: r.cli, requires: r.requires, prefer: r.prefer, weight: r.weight, repo: r.repo, priority: r.priority, source: `routine:${r.name}`,
+          ...(pin ? { host: pin } : {}),
+        });
+        const old = supersedeProposed(r.name, id, pin); // a newer run replaces older unapproved copies
+        if (old.length) journal(host, `⏰ routine \`${r.name}\`: ${id} supersedes ${old.join(", ")}`);
+        state[r.name] = new Date().toISOString();
+        journal(host, `⏰ routine \`${r.name}\` → ${id} (${r.agent})`);
+      } catch (e) { state[r.name] = new Date().toISOString(); journal(host, `💥 routine \`${r.name}\` failed, others continue: ${(e as Error).message?.slice(0, 200)}`); }
     }
-    // scheduler "each": every machine runs its own copy, pinned to it (e.g. the weekly security check of this computer)
-    const pin = owner === "each" ? host : undefined;
-    const queued = routineQueued(r.name, pin); // a copy queued or running → this run is redundant
-    if (queued) { state[r.name] = new Date().toISOString(); journal(host, `⏰ routine \`${r.name}\` skipped: ${queued} still queued/running`); continue; }
-    if (r.signal && !signalChanged(r, state)) { state[r.name] = new Date().toISOString(); continue; } // nothing new → no AI run
-    if (r.agent === "architect") computeMetrics(r.name === "evolve-deep" ? 30 : 7);
-    const prompt = r.readonly ? `${r.prompt}\n\nRead-only routine: observe and report only. Do not change code, PRs, issues or settings; propose any change as a follow-up.` : r.prompt;
-    const id = newTask(`${r.name}${pin ? ` · ${pin}` : ""} · ${new Date().toLocaleString("sv-SE").slice(0, 16)}`, prompt, {
-      agent: r.agent, cli: r.cli, requires: r.requires, prefer: r.prefer, weight: r.weight, repo: r.repo, priority: r.priority, source: `routine:${r.name}`,
-      ...(pin ? { host: pin } : {}),
-    });
-    const old = supersedeProposed(r.name, id, pin); // a newer run replaces older unapproved copies
-    if (old.length) journal(host, `⏰ routine \`${r.name}\`: ${id} supersedes ${old.join(", ")}`);
-    state[r.name] = new Date().toISOString();
-    journal(host, `⏰ routine \`${r.name}\` → ${id} (${r.agent})`);
+  } finally {
+    // always persist what ran: losing this file re-fires every short routine on the next tick
+    mkdirSync(P("logs"), { recursive: true });
+    writeFileSync(STATE, JSON.stringify(state, null, 2));
   }
-  mkdirSync(P("logs"), { recursive: true });
-  writeFileSync(STATE, JSON.stringify(state, null, 2));
 }
 
 // ------------------------------------------------------------------ task processing
@@ -541,6 +565,11 @@ function wakeParents(host: string, ready = new Set<string>()) {
 }
 const runningIds = new Set<string>();
 
+/** Queue-flow observability: when tasks keep waiting while the claim loop bails (no AI account, GitHub
+ *  starved, nothing claimable), journal it at most once an hour — a blind queue must be visible at once,
+ *  not discovered hours later (2026-11-08: the queue starved silently overnight). */
+let stallSince = 0, stallReason = "", lastStallNote = 0;
+
 /** Waits with a wait_check: the daemon runs it itself (no agent) with backoff 5 → 10 → 20 → 40 minutes; once its exit
  * code differs from the first run, the wait is over. Human waits are checked too: that is how an event (PR merged) wakes them. */
 const waitChecks = new Map<string, { cmd: string; base?: number; next: number; n: number }>();
@@ -639,16 +668,20 @@ export async function tick(cfg: Cfg, background = false) {
   const ready = primary ? await checkWaits().catch(() => new Set<string>()) : new Set<string>();
   await locked(async () => {
     await _pull();
+    // every step isolated: one failing step must never skip the rest or the claim loop below
+    const guard = async (name: string, fn: () => unknown | Promise<unknown>) => {
+      try { await fn(); } catch (e) { journal(host, `💥 ${name}: ${(e as Error).message?.slice(0, 200)}`); }
+    };
     try { writeRules(); } catch (e) { console.error(`rules.md: ${e}`); }
-    heartbeat(cfg, running, sample(cfg));
+    await guard("heartbeat", () => heartbeat(cfg, running, sample(cfg)));
     if (primary) {
-      runRoutines(cfg, host, primary);
-      reapStale(cfg, host);
-      wakeParents(host, ready);
-      maybeSupervise(cfg, host);
-      await proposeBatch(cfg, host);
-      noteUnservable(cfg, host);
-    } else reapStale(cfg, host, true);
+      await guard("routines", () => runRoutines(cfg, host, primary));
+      await guard("reap", () => reapStale(cfg, host));
+      await guard("wake parents", () => wakeParents(host, ready));
+      await guard("supervisor", () => maybeSupervise(cfg, host));
+      await guard("proposals", () => proposeBatch(cfg, host));
+      await guard("placement", () => noteUnservable(cfg, host));
+    } else await guard("reap", () => reapStale(cfg, host, true));
     await _commitPush(`[${host}] tick`);
   });
   pruneMediaHourly(cfg);
@@ -676,12 +709,22 @@ export async function tick(cfg: Cfg, background = false) {
     const s = sample(cfg);
     const max = allowedParallel(s, cfg, running);
     if (running >= max) break;
-    if (!pickAccount(cfg, CLIS.map((a) => a.name).filter((c) => Bun.which(c)))) break;
-    if ((await githubStarved(cfg)).starved && list(P("tasks", "inbox"), /^T-.*\.md$/).every((p) => GH_HEAVY.has(readDoc(p).meta.agent))) break;
+    if (!pickAccount(cfg, CLIS.map((a) => a.name).filter((c) => Bun.which(c)))) { stallSince ||= Date.now(); stallReason = "no usable AI account"; break; }
+    if ((await githubStarved(cfg)).starved && list(P("tasks", "inbox"), /^T-.*\.md$/).every((p) => GH_HEAVY.has(readDoc(p).meta.agent))) { stallSince ||= Date.now(); stallReason = "GitHub quota starved"; break; }
     const t = pickTask(cfg, s.loadRatio, canRunHeavy(s, cfg, running));
-    if (!t) break;
+    if (!t) {
+      const waiting = list(P("tasks", "inbox"), /^T-.*\.md$/).length;
+      if (!waiting) stallSince = 0;
+      else { stallSince ||= Date.now(); stallReason = "no claimable task (requirements no host here meets)"; }
+      break;
+    }
+    stallSince = 0;
     const active = await claim(t, host);
-    if (!active) { if (tried.has(t)) break; tried.add(t); continue; } // e.g. offline: don't spin on the same task
+    if (!active) {
+      // e.g. offline: don't spin on the same task; if the claim keeps failing while tasks wait, say so
+      if (tried.has(t)) { stallSince ||= Date.now(); stallReason = "task claim could not be committed (sync lost a race, or offline)"; break; }
+      tried.add(t); continue;
+    }
     running++;
     const tid = readDoc(active).meta.id;
     runningIds.add(tid);
@@ -690,6 +733,14 @@ export async function tick(cfg: Cfg, background = false) {
       .finally(() => { running--; runningIds.delete(tid); });
     jobs.push(job);
   }
+  // say it once an hour until it clears: tasks are waiting and nothing can claim them
+  const waitingTasks = list(P("tasks", "inbox"), /^T-.*\.md$/).filter((p) => !readDoc(p).meta.parked);
+  if (!draining && waitingTasks.length && stallSince && Date.now() - stallSince > 10 * 60_000 && Date.now() - lastStallNote > 3_600_000) {
+    lastStallNote = Date.now();
+    const oldest = Math.min(...waitingTasks.map((p) => Date.parse(readDoc(p).meta.created ?? "") || Date.now()));
+    journal(host, `⏸ queue stalled: ${stallReason} — ${waitingTasks.length} task(s) waiting, oldest ${Math.round((Date.now() - oldest) / 60_000)} min (check accounts: hub status)`);
+  }
+  if (!waitingTasks.length) stallSince = 0;
   if (!background) await Promise.all(jobs);
 }
 
@@ -734,10 +785,14 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
   if (!r || typeof r !== "object") return; // planner unavailable: tasks run unplanned after plan_wait_minutes
   await locked(async () => {
     await _pull();
+    // the planner names caps from the host list, but sometimes without the kind prefix ("cargo" instead of
+    // "cli:cargo") — a bare name no host can ever match would park the task forever (T-0057, 2026-11-08)
+    const tools = [...CLIS.map((a) => a.name), "gh", "cargo", "bun", "node"];
+    const norm = (t: string) => (/^(os|host|arch|cli):/.test(t) ? t : tools.includes(t) ? `cli:${t}` : t);
     for (const t of todo) {
       const v = r[t.meta.id];
       if (!v || !existsSync(t.p)) continue;
-      const req = [...new Set([...(t.meta.requires ?? "").split(","), ...String(v.requires ?? "").split(",")].map((x) => x.trim()).filter(Boolean))].join(",");
+      const req = [...new Set([...(t.meta.requires ?? "").split(","), ...String(v.requires ?? "").split(",")].map((x) => norm(x.trim())).filter(Boolean))].join(",");
       const pinned = t.meta.cli && t.meta.cli !== "auto";
       const channelSlugs = [...new Set([...(t.meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(v.channels)])].join(",");
       const planned = byName(String(v.cli ?? ""))?.name;

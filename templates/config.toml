@@ -9,6 +9,7 @@ max_followup_depth = 4                # stop runaway follow-up chains
 primary = "__PRIMARY__"            # always-on Linux PC: runs routines, judge, Slack/Discord polling, reaping
 offline_after_minutes = 8             # no heartbeat for this long → host considered offline (at least 8: heartbeats go up every ~5 min)
 reap_after_minutes = 20               # active task on an offline host → requeued
+queue_release_minutes = 60            # queued routine copy older than this (or one interval) → released so the routine fires again
 prefer_wait_minutes = 10              # soft 'prefer' waits at most this long for an online preferred host
 
 [update]

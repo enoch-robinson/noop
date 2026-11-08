@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { P, list, readDoc, writeDoc } from "../src/core";
-import { sweepPlatform, alreadyAsked, cardFor, checkUnrunnable, classify, groupByCause, supervise, type Ctx, type Task } from "../src/supervisor";
+import { sweepPlatform, alreadyAsked, cardFor, checkUnrunnable, classify, classifyParked, groupByCause, supervise, type Ctx, type Task } from "../src/supervisor";
 import { closeDecision, ignoreDecision } from "../src/decisions";
 
 const H = 3_600_000;
@@ -114,6 +114,35 @@ test("dated follow-ups are exempt; a delegated parent on a retired host is re-pi
   const stuck = classify(task({ id: "T-5", requires: "os:macos", wakes: "7" }), ctx())!;
   expect(classify(young, ctx())).toBeNull();
   expect(sweepPlatform([young], [stuck]).map((v) => [v.id, v.cause])).toEqual([["T-4", "platform:os:macos"]]);
+});
+
+test("inbox watchdog: long-parked tasks escalate once, young or unparked ones stay quiet", () => {
+  const old = classifyParked({ id: "T-1", parked: new Date(NOW - 5 * H).toISOString(), requires: "cli:gh,cargo", created: new Date(NOW - 5 * H).toISOString() }, ctx())!;
+  expect(old.action).toBe("escalate");
+  expect(old.cause).toBe("parked:cli:gh,cargo");
+  expect(old.reasons[0]).toContain("5 小时");
+  expect(classifyParked({ id: "T-2", parked: new Date(NOW - H).toISOString(), created: new Date(NOW - H).toISOString() }, ctx())).toBeNull();
+  expect(classifyParked({ id: "T-3" }, ctx())).toBeNull(); // queued but not parked: the queue handles it
+});
+
+test("supervise(): parked inbox tasks get one grouped card and move under it (never silence for 15 h again)", () => {
+  mkdirSync(P("journal"), { recursive: true });
+  for (const f of ["waiting", "blocked", "inbox"]) mkdirSync(P("tasks", f), { recursive: true });
+  mkdirSync(P("decisions", "open"), { recursive: true }); mkdirSync(P("decisions", "closed"), { recursive: true });
+  mkdirSync(P("fleet", "hosts"), { recursive: true });
+  const t0 = new Date(Date.now() - 10 * H).toISOString();
+  for (const id of ["T-0301", "T-0302"]) writeDoc(P("tasks", "inbox", `${id}.md`), { id, title: id, requires: "cli:gh,cargo", parked: t0, created: t0 }, "body");
+  const res = supervise({ fleet: {} }, "lb");
+  expect(res.cards).toBe(1);
+  const card = list(P("decisions", "open")).map((p) => readDoc(p).meta).find((m) => m.supervisor_cause === "parked:cli:gh,cargo");
+  expect(card?.tasks).toBe("T-0301,T-0302");
+  for (const id of ["T-0301", "T-0302"]) {
+    expect(existsSync(P("tasks", "inbox", `${id}.md`))).toBe(false);
+    expect(readDoc(P("tasks", "blocked", `${id}.md`)).meta.decision).toBe(card!.id);
+  }
+  expect(supervise({ fleet: {} }, "lb").cards).toBe(0); // still under the card: never asked again
+  for (const id of ["T-0301", "T-0302"]) rmSync(P("tasks", "blocked", `${id}.md`), { force: true });
+  rmSync(P("decisions", "open", `${card!.id}.md`), { force: true });
 });
 
 test("macOS host online + wait_check unrunnable on the primary: hand back to the Mac once, not a card", () => {

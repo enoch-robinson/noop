@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { due } from "../src/cli";
+import { due, everyMinutes } from "../src/cli";
 import { matches, signature, type Cfg } from "../src/core";
 import { parseResult, runAgent } from "../src/runner";
 
@@ -15,6 +15,10 @@ test("routine schedule", () => {
   expect(due("weekly FRI 17:00", undefined, t)).toBe(false);
   expect(due("daily 20:00", undefined, t)).toBe(false);
   expect(due("daily 02:30", undefined, t)).toBe(false); // first run long after slot → wait for next slot
+  expect(everyMinutes("10m")).toBe(10);
+  expect(everyMinutes("hourly")).toBe(60);
+  expect(everyMinutes("daily 02:30")).toBe(1440);
+  expect(everyMinutes("weekly MON 09:30")).toBe(10_080);
 });
 
 test("capability matching", () => {

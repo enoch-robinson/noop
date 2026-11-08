@@ -98,7 +98,7 @@ function readCodex(file: string, tool: string): Turn[] {
     if (l.type === "session_meta" && p.cwd) project = basename(p.cwd);
     if (l.type === "turn_context" && p.cwd) project = basename(p.cwd);
     if (l.type !== "response_item" || p.type !== "message") continue;
-    const txt = (p.content ?? []).map((x: any) => x.text ?? "").join("\n");
+    const txt = textContent(p.content);
     if (p.role === "assistant") { lastAssistant = txt; continue; }
     if (p.role !== "user") continue;
     if (FLEET_PROMPT.test(txt)) return [];
@@ -106,6 +106,15 @@ function readCodex(file: string, tool: string): Turn[] {
     if (t) out.push({ ts: l.timestamp ?? "", project, tool, text: t, prev: lastAssistant.slice(-400) });
   }
   return out;
+}
+
+/** Message content arrives as a text-part array in most formats but as a plain string in others
+ *  (pi/omp v3 system messages, some codex items). One reader for both shapes, so a shape change
+ *  can never crash the learn run again (2026-11-08: a string content killed every tick for hours). */
+function textContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.filter((x: any) => x?.type === "text").map((x: any) => x.text ?? "").join("\n");
+  return "";
 }
 
 /** pi/omp session JSONL (omp derives from pi): the session line carries the cwd, message lines carry role + text content. */
@@ -118,7 +127,7 @@ export function readPiStyle(file: string, tool: string): Turn[] {
     if (l.type === "session" && l.cwd) project = basename(l.cwd);
     if (l.type !== "message") continue;
     const m = l.message ?? {};
-    const txt = (m.content ?? []).filter((x: any) => x.type === "text").map((x: any) => x.text).join("\n");
+    const txt = textContent(m.content);
     if (m.role === "assistant") { if (txt) lastAssistant = txt; continue; }
     if (m.role !== "user") continue;
     if (FLEET_PROMPT.test(txt)) return []; // whole session is a fleet agent run
@@ -159,7 +168,12 @@ export function collect(cfg: Cfg, opts: { full?: boolean; maxChars?: number } = 
       const m = statSync(f).mtimeMs;
       if (typeof state[f] === "number" && state[f] >= m) continue;
       if (Date.now() - m < 10 * 60_000) continue; // skip live sessions
-      const t = s.read(f, s.name);
+      let t: Turn[];
+      try { t = s.read(f, s.name); } catch (e) {
+        // one unreadable session file must not kill the learn run (or the whole tick); retry it next run
+        console.error(`learn: skipping unreadable ${f}: ${(e as Error).message}`);
+        continue;
+      }
       state[f] = m;
       if (t.length) { sessions++; turns.push(...t); }
     }

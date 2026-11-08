@@ -1,12 +1,14 @@
 // Stall supervisor: like a team lead chasing progress. Every ~30 minutes it looks at waiting/blocked tasks, keeps them
 // going where it can (re-route away from retired/offline hosts, resume tasks whose card was already answered, requeue
-// tasks that wait on nothing), and only then raises ONE decision card per root cause for what is still stuck.
-// Gates are never touched: a supervisor card never sets gate_override, so merge/release/external messages stay gated.
+// tasks that wait on nothing), plus an inbox watchdog: tasks parked on capabilities no online host has are escalated
+// once (grouped) instead of sitting in silence forever. Only then it raises ONE decision card per root cause for what
+// is still stuck. Gates are never touched: a supervisor card never sets gate_override, so merge/release/external
+// messages stay gated.
 import { existsSync, unlinkSync } from "node:fs";
 import { type Cfg, type HostBeat, P, journal, list, nextId, now, onlineHosts, readDoc, writeDoc } from "./core";
 
 export type Meta = Record<string, string>;
-export type Task = { meta: Meta; folder: "waiting" | "blocked"; body?: string };
+export type Task = { meta: Meta; folder: "waiting" | "blocked" | "inbox"; body?: string };
 export type Ctx = {
   now: number;
   online: HostBeat[];
@@ -30,6 +32,18 @@ export function checkUnrunnable(check: string | undefined, primaryOs: string): b
   if (primaryOs !== "macos" && /\/Users\/|\bswift\b|\bxcrun\b|\bosascript\b/.test(check)) return true;
   if (primaryOs !== "windows" && /[A-Z]:\\|powershell|\.exe\b/i.test(check)) return true;
   return false;
+}
+
+/** Inbox watchdog: a task parked on requirements no online host satisfies will never move by itself.
+ *  Escalate once per requirement set (the owner can cancel, de-scope or keep waiting); younger ones wait.
+ *  (T-0057, 2026-11-08: one planner typo — bare "cargo" instead of "cli:cargo" — parked a task for 15 h
+ *  with no signal at all.) Pure: unit-tested. */
+export function classifyParked(m: Meta, ctx: Ctx): Verdict | null {
+  if (!m.parked) return null;
+  const age = (ctx.now - Date.parse(m.parked)) / 3_600_000;
+  if (age < ctx.maxAgeHours) return null;
+  const reqs = (m.requires ?? "").split(",").map((s) => s.trim()).filter(Boolean).join("+") || "所需能力";
+  return { id: m.id, cause: `parked:${m.requires || "caps"}`, reasons: [`已停靠 ${Math.floor(age)} 小时，没有在线主机满足 ${reqs}`], action: "escalate" };
 }
 
 /** Decide what is wrong with one waiting/blocked task and what to do first. Pure: unit-tested. */
@@ -100,6 +114,7 @@ export function alreadyAsked(cause: string, ids: string[], cards: Meta[]): strin
 
 const CAUSE_LABEL = (c: string) =>
   c === "platform:os:macos" ? "macOS 任务推不动" : c === "platform:os:windows" ? "Windows 任务推不动"
+    : c.startsWith("parked:") ? `没有主机能满足 ${c.slice(7) || "所需能力"}，任务停着`
     : c.startsWith("host:") ? `主机 ${c.slice(5)} 不可用` : c === "no-wait" ? "没有记录等待条件" : c.startsWith("slow:") ? `${c.slice(5)} 上的长时间运行` : c;
 
 export function cardFor(cause: string, items: { id: string; title: string; reasons: string[] }[]) {
@@ -132,12 +147,12 @@ export function supervise(cfg: Cfg, host: string, t = Date.now()) {
     now: t, online: onlineHosts(cfg), retired, primaryOs: process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux",
     maxAgeHours: s.max_age_hours ?? 3, maxWakes: s.max_wakes ?? 3, decision: decisionState,
   };
-  const tasks: (Task & { path: string })[] = (["waiting", "blocked"] as const).flatMap((folder) =>
+  const tasks: (Task & { path: string })[] = (["waiting", "blocked", "inbox"] as const).flatMap((folder) =>
     list(P("tasks", folder), /^T-.*\.md$/).map((path) => ({ path, folder, ...readDoc(path) })));
   const verdicts: Verdict[] = [];
   const counts = { reroute: 0, resume: 0, requeue: 0, cards: 0 };
   for (const task of tasks) {
-    const v = classify(task, ctx);
+    const v = task.folder === "inbox" ? classifyParked(task.meta, ctx) : classify(task, ctx);
     if (!v) continue;
     const { meta, body } = task;
     const back = (extra: Record<string, string | undefined>, note: string) => {
@@ -175,11 +190,11 @@ export function supervise(cfg: Cfg, host: string, t = Date.now()) {
     for (const id of fresh) { // parked under the card: the answer resumes every task (closeDecision reads `tasks`)
       const x = byId.get(id)!;
       writeDoc(P("tasks", "blocked", `${id}.md`), { ...x.meta, status: "needs_decision", decision: did, wake_at: undefined }, x.body ?? "");
-      if (x.folder === "waiting") unlinkSync(x.path);
+      if (x.folder !== "blocked") unlinkSync(x.path);
     }
     journal(host, `🧭 supervisor: ${CAUSE_LABEL(cause)} → ${did}（${fresh.join(", ")}）`); counts.cards++;
     cards.push({ supervisor_cause: cause, tasks: fresh.join(",") });
   }
-  journal(host, `🧭 supervisor ran: ${tasks.length} waiting/blocked, rerouted ${counts.reroute}, resumed ${counts.resume}, requeued ${counts.requeue}, cards ${counts.cards}`);
+  journal(host, `🧭 supervisor ran: ${tasks.length} waiting/blocked/inbox, rerouted ${counts.reroute}, resumed ${counts.resume}, requeued ${counts.requeue}, cards ${counts.cards}`);
   return counts;
 }
