@@ -201,17 +201,31 @@ export function scan(st: State): Change[] {
 }
 
 // ------------------------------------------------------------------ cross-process lock (CLI commands vs. the daemon)
-async function withLock<T>(fn: () => Promise<T>): Promise<T> {
+// The lock only serializes concurrent syncs — the versioned commit settles real races (409 → pull → rebase) — so it
+// must never wedge or kill a process: a crashed holder is broken as stale, and a waiter that times out (holder
+// alive but slow, e.g. a big push over a cold Worker) breaks the lock and proceeds. This used to throw
+// "lock held for over a minute", which killed whichever process hit it — on a host that meant the daemon dying
+// and the fleet idling until something restarted it. Exported for tests; tokenized so a broken holder's cleanup
+// never removes the next holder's lock.
+export async function withLock<T>(fn: () => Promise<T>, timeoutMs = 60_000): Promise<T> {
   mkdirSync(HOME(), { recursive: true });
-  const deadline = Date.now() + 60_000;
+  const deadline = Date.now() + timeoutMs;
+  const token = join(LOCK(), String(process.pid));
   for (;;) {
-    try { mkdirSync(LOCK()); break; } catch {
-      try { if (Date.now() - statSync(LOCK()).mtimeMs > 120_000) { rmSync(LOCK(), { recursive: true, force: true }); continue; } } catch { continue; }
-      if (Date.now() > deadline) throw new Error(`sync: lock ${LOCK()} held for over a minute`);
+    try { mkdirSync(LOCK()); try { writeFileSync(token, ""); } catch {} break; } catch {
+      let age = 0;
+      try { age = Date.now() - statSync(LOCK()).mtimeMs; } catch { continue; } // released between mkdir and stat: race for it again
+      if (age > 120_000 || Date.now() > deadline) { // stale holder, or a live one too slow to keep waiting on
+        console.error(`sync: lock ${LOCK()} held for ${Math.round(age / 1000)}s — breaking it and syncing anyway`);
+        rmSync(LOCK(), { recursive: true, force: true });
+        continue;
+      }
       await Bun.sleep(50);
     }
   }
-  try { return await fn(); } finally { rmSync(LOCK(), { recursive: true, force: true }); }
+  try { return await fn(); } finally { // the lock may have been broken and taken over while we ran: only clean up our own token
+    try { rmSync(token, { force: true }); if (existsSync(LOCK()) && readdirSync(LOCK()).length === 0) rmSync(LOCK(), { recursive: true, force: true }); } catch {}
+  }
 }
 
 // ------------------------------------------------------------------ pull

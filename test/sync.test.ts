@@ -1,8 +1,8 @@
 // Data sync: host mirror (src/sync.ts) against the real Worker files module (cloud/src/files.ts) over bun:sqlite.
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, appendFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync, appendFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import * as sync from "../src/sync";
 
 let W = "", t: sync.Transport;
@@ -225,4 +225,22 @@ test("a replaced Worker (older copy, lower revs) is re-learned and our newer fil
   expect(await sync.commitPush("a: beat 6")).toBe(true); // normal CAS again
   expect(await read("fleet/hosts/a.json")).toBe("{\"seen\":6}\n");
   sync.setTransport(t);
+});
+
+test("sync lock: stale or slow holders are broken, never fatal; cleanup only removes our own token", async () => {
+  as("a");
+  const lock = join(dirname(hosts.a), "sync.lock"); // the lock lives next to the mirror (HOME), not inside it
+  // a crashed holder (lock older than 2 min) is broken at once instead of throwing
+  mkdirSync(lock, { recursive: true });
+  utimesSync(lock, new Date(Date.now() - 130_000), new Date(Date.now() - 130_000));
+  expect(await sync.pull({ force: true })).toBe(true);
+  expect(existsSync(lock)).toBe(false); // pull's cleanup removed the (now empty) lock dir
+  // a holder that is alive but slow: the waiter breaks the lock after its timeout and proceeds
+  const slow = sync.withLock(async () => { await Bun.sleep(150); });
+  expect(await sync.withLock(async () => "broke through", 50)).toBe("broke through");
+  await slow; // the broken holder's cleanup must not remove the new holder's lock, and the last one out closes
+  expect(existsSync(lock)).toBe(false);
+  // and sync still works normally afterwards
+  put("a", "tasks/inbox/T-0902.md", "after lock\n");
+  expect(await sync.commitPush("a: after lock")).toBe(true);
 });
