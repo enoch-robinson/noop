@@ -47,6 +47,18 @@ test("keep going first: retired host → reroute, answered card → resume, no w
   expect(classify(task({ id: "T-5", children: "T-6" }), ctx())).toBeNull(); // delegated parent
 });
 
+test("parked on the owner: human waits and blocked waits naming an open card are never clock-escalated", () => {
+  const late = { created: new Date(NOW - 5 * H).toISOString() }; // well past maxAgeHours
+  expect(classify(task({ id: "T-1", ...late, wait_kind: "human" }), ctx())).toBeNull();
+  expect(classify(task({ id: "T-2", ...late, wait_kind: "human" }, "blocked"), ctx())).toBeNull();
+  expect(classify(task({ id: "T-3", ...late, waiting_on: "owner 答复 D-9（decisions/open/D-9.md）" }, "blocked"),
+    ctx({ decision: (d) => (d === "D-9" ? "open" : undefined) }))).toBeNull();
+  // an answered card still resumes first (the refresh path), even when parked on the owner
+  const r = classify(task({ id: "T-4", ...late, wait_kind: "human", decision: "D-7" }, "blocked"),
+    ctx({ decision: (d) => (d === "D-7" ? "closed" : undefined) }))!;
+  expect(r.action).toBe("resume");
+});
+
 test("groups by cause: all macOS-desktop tasks share one card", () => {
   const vs = ["T-1", "T-2", "T-3"].map((id) => classify(task({ id, requires: "os:macos", wakes: "5" }), ctx())!);
   vs.push(classify(task({ id: "T-9", requires: "os:linux", wakes: "4", claimed_by: "lb" }), ctx())!);

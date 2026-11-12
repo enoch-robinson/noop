@@ -52,6 +52,11 @@ export function classify(t: Task, ctx: Ctx): Verdict | null {
   // 2. blocked on a card that is already closed → the answer never reached it
   if (t.folder === "blocked" && m.decision && ctx.decision(m.decision) === "closed") return v(`answered:${m.decision}`, "resume", [`${m.decision} 已回答但任务没有继续`]);
   if (t.folder === "blocked" && m.decision && ctx.decision(m.decision) === "open") return null; // the owner has the card
+  // parked on the owner: a human wait is a state, not a stall — the runner parks these to wake only on an event,
+  // never on a timer, so a clock-based card would just add a second unanswered card about the first one
+  // (2026-11-11/12: six slow: cards for idle-menu tasks that were waiting on the owner's menu answer).
+  if (m.wait_kind === "human") return null;
+  if (t.folder === "blocked" && (m.waiting_on ?? "").match(/D-\d+/g)?.some((id) => ctx.decision(id) === "open")) return null;
   const age = (ctx.now - startedAt(m)) / 3_600_000;
   const wakes = Number(m.wakes ?? 0);
   const reasons: string[] = [];
