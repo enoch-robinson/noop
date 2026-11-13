@@ -174,8 +174,14 @@ export function hostCaps(cfg: Cfg): string[] {
   return [`os:${os}`, `host:${hostName(cfg)}`, `arch:${process.arch}`, ...clis, ...(cfg.host?.caps ?? [])];
 }
 
-/** One requirement; "a|b" means either cap will do (e.g. cli:bun|cli:node). */
-export const capOk = (req: string, caps: string[]) => req.split("|").some((r) => caps.includes(r.trim()));
+/** One requirement; "a|b" means either cap will do (e.g. cli:bun|cli:node). A bare tool name
+ *  ("cargo") also matches its cli:-prefixed cap: planners sometimes emit unprefixed tokens, and an
+ *  exact-only match parks such a task on every host forever (park + unpark both check the same way). */
+export const capOk = (req: string, caps: string[]) =>
+  req.split("|").some((r) => {
+    const t = r.trim();
+    return caps.includes(t) || caps.includes(`cli:${t}`);
+  });
 
 /** Toolchain a repo needs, read from its manifest files. Empty when the repo dir is not on this machine. */
 export function repoRequires(repo?: string): string[] {

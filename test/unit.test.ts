@@ -111,6 +111,10 @@ test("repo language → host requirements (only when the repo is on disk)", asyn
   expect(matches({ repo: js }, mac)).toBe(true); // node is enough for package.json
   expect(matches({ repo: js }, ["os:linux"])).toBe(false);
   expect(capOk("cli:bun|cli:node", ["cli:bun"])).toBe(true);
+  expect(capOk("cargo", ["os:linux", "cli:cargo"])).toBe(true); // planner may emit a bare tool name
+  expect(capOk("gh", ["cli:gh"])).toBe(true);
+  expect(capOk("cli:gh", ["os:linux"])).toBe(false); // still no invented capabilities
+  expect(capOk("host:laptop", ["os:linux", "host:vibe-coding"])).toBe(false); // prefix stays exact
   expect(matches({ repo: "/nonexistent/repo/xyz", requires: "cli:cargo" }, mac)).toBe(false); // stored at creation
 });
 
